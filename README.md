@@ -1,25 +1,69 @@
 # 🌐 Cloudflare Tunnel Monitor
 
-这是一个基于 Cloudflare Workers 和 KV 数据库构建的 **轻量级、高颜值、零成本** 的 Cloudflare Tunnel 隧道在线监控面板。支持 7×24 小时自动拨测、历史在线率统计（热力图趋势）、移动端深度适配以及 Telegram 机器人实时故障离线/恢复告警。
+这是一个基于 Cloudflare Workers 和 KV 数据库构建的 **轻量级、高颜值、零成本** 的 Cloudflare Tunnel 隧道在线监控面板。支持 7×24 小时自动拨测、历史在线率统计（热力趋势图）、移动端深度适配、智能防呆按钮以及 Telegram 机器人实时故障离线/恢复告警。
 
 ## ✨ 特性功能
-- ⚡ **无感秒开**：基于读写分离架构，前端页面毫秒级瞬间加载。
+- ⚡️ **无感秒开**：基于读写分离架构，前端页面毫秒级瞬间加载。
 - 📱 **移动适配**：完美适配手机端单手浏览，支持大盘节点一键折叠与快捷快览。
-- 🔔 **实时告警**：隧道离线或恢复上线时，Telegram 机器人秒级推送。
+- 🔔 **实时告警**：隧道离线或恢复上线时，Telegram 机器人秒级精准推送。
 - 📊 **一键状态**：支持在面板上一键将当前所有隧道的运行简报手动推送到 Telegram。
-- ⏱️ **北京时间**：告警与简报时区精准锁定北京时间。
+- ⏱️ **北京时间**：告警与简报时区精准锁定北京时间，不再有 8 小时时差困扰。
+- 🛡️ **智能防呆**：若未配置 Telegram 或 ARGO 隧道，前端按钮会自动变灰并显示“TG未配置”或“隧道未配置”。
 
-## 🛠️ 部署教程
+---
 
-### 1. 创建 Cloudflare Worker
-1. 登录 Cloudflare 控制台，进入 `Workers & Pages`。
-2. 点击 `Create Application` -> `Create Worker`。
-3. 复制本项目中的 `index.js` 代码，覆盖并点击 `Save and Deploy`。
+## 🛠️ 详细部署教程
 
-### 2. 配置环境变量 (Settings -> Variables)
-在 Worker 的配置后台中，添加以下 `Environment Variables`（环境变量）：
-- `ARGO`：填入你需要监控的隧道信息，格式为 `节点名称-----你的域名`（多个节点换行输入）。
-  *示例：*
-  ```text
-  香港主路由-----hk.yourdomain.com
-  美国备用机-----us.yourdomain.com
+### 第一步：创建 Cloudflare Worker
+1. 登录 Cloudflare 控制台，在左侧导航栏选择 `Workers & Pages`（Workers 和 Pages）。
+2. 点击 `Create Application`（创建应用程序） -> `Create Worker`（创建 Worker）。
+3. 为你的 Worker 起一个名字（例如 `tunnel-monitor`），然后点击 `Deploy`（部署）。
+4. 部署完成后，点击 `Edit Code`（编辑代码），将本项目 `index.js` 中的全部代码复制并**完全覆盖**里面的默认代码。
+5. 点击右上角的 `Deploy`（部署）保存。
+
+### 第二步：创建并绑定 KV 数据库
+由于监控需要记录历史在线率（24小时绿红格子热力图），必须绑定一个 KV 数据库：
+1. 回到 Cloudflare 主控制台，点击左侧菜单的 `KV`。
+2. 点击 `Create a Namespace`（创建命名空间），输入名字：`tunnel_monitor`，点击添加。
+3. 回到你刚才创建的 Worker 页面，点击 `Settings`（设置）选项卡 -> 选择 `Bindings`（绑定）。
+4. 在 `KV Namespace Bindings`（KV 命名空间绑定）部分点击 `Add Binding`（添加绑定）：
+   - **Variable name（变量名称）**：必须**大写**填入 `KV`
+   - **KV namespace（KV 命名空间）**：下拉菜单选择你刚才创建的 `tunnel_monitor`
+5. 点击保存。
+
+### 第三步：配置环境变量 (Variables)
+在 Worker 页面的 `Settings`（设置）选项卡中，选择 `Variables`（变量），点击 `Add Variable`（添加变量）配置以下内容：
+1. **`ARGO`**：填入你需要监控的隧道，格式为 `自定义名称-----你的域名`（注意中间是 5 个短横线）。如果有多个节点，**直接回车换行**输入即可。
+   配置示例：
+   香港主隧道-----hk.yourdomain.com
+   美国副隧道-----us.yourdomain.com
+2. **`BOT_TOKEN`**：填入你的 Telegram 机器人的 Token（可选，不填前端按钮会显示“TG未配置”）。
+3. **`CHAT_ID`**：填入你的 Telegram 账号 ID 或群组 ID（可选）。
+
+配置完成后，记得点击 **`Save and Deploy`（保存并部署）**。
+
+### 第四步：添加定时触发器 (Cron Triggers)
+让 Worker 实现 7×24 小时自动拨测检测：
+1. 在 Worker 页面选择 `Settings`（设置） -> `Triggers`（触发器）。
+2. 下拉找到 `Cron Triggers`（定时触发器），点击 `Add Trigger`（添加触发器）。
+3. 在 Cron 表达式中选择或输入你的触发频率：
+   - 比如输入 `*/5 * * * *` 表示每 5 分钟自动检测一次。
+   - 节点较多时，建议设置为 `*/10 * * * *`（每 10 分钟检测一次）。
+
+---
+
+## 🤝 鸣谢与致谢 (Credits)
+
+本项目的诞生离不开开源社区的灵感碰撞与 AI 工具的辅助支持，特别感谢以下付出：
+
+1. **感谢 佬王 (eooce)** 提供了优秀的开源网络探针基础逻辑参考：https://github.com/eooce/Databricks-keepalive-workers/blob/main/_worker.js
+   > ✨ 欢迎大家前往 GitHub 给大佬的项目**点亮 Star 🌟**，并前往 YouTube 关注大佬的频道，获取更多好玩实用的技术分享！
+
+2. **感谢 ChatGPT (免费版)** 负责了项目前期的代码初步整合、核心架构搭建以及高颜值 UI 界面的初步制作。
+
+3. **感谢 Gemini (免费版)** 负责了后续多节点大盘快览、移动端适配重构、本地状态记忆、北京时区精准锁定、智能防呆逻辑等代码的全面修正与功能完善。
+
+---
+
+## 📝 开源协议
+本项目基于 MIT 协议开源，欢迎自由分发、修改及使用。
