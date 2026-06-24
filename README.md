@@ -29,7 +29,7 @@
 1. 登录 Cloudflare 控制台，在左侧导航栏选择 `Workers & Pages`（Workers 和 Pages）。
 2. 点击 `Create Application`（创建应用程序） -> `Create Worker`（创建 Worker）。
 3. 为你的 Worker 起一个名字（例如 `tunnel-monitor`），然后点击 `Deploy`（部署）。
-4. 部署完成后，点击 `Edit Code`（编辑代码），将本项目 `index.js（可执行选择KV/D1版本）` 中的全部代码复制并**完全覆盖**里面的默认代码。
+4. 部署完成后，点击 `Edit Code`（编辑代码），将本项目 `index.js（可自行选择KV/D1版本）` 中的全部代码复制并**完全覆盖**里面的默认代码。
 5. 点击右上角的 `Deploy`（部署）保存。
 
 ---
