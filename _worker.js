@@ -1,6 +1,6 @@
 // ========================================
 // Cloudflare Tunnel Monitor
-// Version: 1.1 (Beijing Time & Intelligent Button Status)
+// Version: 1.0 (Beijing Time & Intelligent Button Status)
 // KV Namespace Variable Name: KV
 // ========================================
 
