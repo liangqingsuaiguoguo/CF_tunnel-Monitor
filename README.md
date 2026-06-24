@@ -1,12 +1,5 @@
 # 🌐 Cloudflare Tunnel Monitor
 
-<p align="center">
-  <img src="[https://img.shields.io/badge/Cloudflare-Workers-F38020?style=for-the-badge&logo=Cloudflare&logoColor=white](https://img.shields.io/badge/Cloudflare-Workers-F38020?style=for-the-badge&logo=Cloudflare&logoColor=white)" alt="Cloudflare Workers" />
-  <img src="[https://img.shields.io/badge/Telegram-Bot-26A5E4?style=for-the-badge&logo=Telegram&logoColor=white](https://img.shields.io/badge/Telegram-Bot-26A5E4?style=for-the-badge&logo=Telegram&logoColor=white)" alt="Telegram Bot" />
-  <img src="[https://img.shields.io/badge/License-MIT-green?style=for-the-badge](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)" alt="MIT License" />
-  <img src="[https://img.shields.io/badge/Cost-Zero-brightgreen?style=for-the-badge](https://img.shields.io/badge/Cost-Zero-brightgreen?style=for-the-badge)" alt="Zero Cost" />
-</p>
-
 这是一个基于 Cloudflare Workers 和 KV/D1 数据库构建的 **轻量级、高颜值、零成本** 的 Cloudflare Tunnel 隧道在线监控面板。支持 7×24 小时自动拨测、历史在线率统计（热力趋势图）、移动端深度适配、智能防呆按钮以及 Telegram 机器人实时故障离线/恢复告警。
 
 ---
@@ -29,7 +22,7 @@
 1. 登录 Cloudflare 控制台，在左侧导航栏选择 `Workers & Pages`（Workers 和 Pages）。
 2. 点击 `Create Application`（创建应用程序） -> `Create Worker`（创建 Worker）。
 3. 为你的 Worker 起一个名字（例如 `tunnel-monitor`），然后点击 `Deploy`（部署）。
-4. 部署完成后，点击 `Edit Code`（编辑代码），将本项目 `index.js（可自行选择KV/D1版本）` 中的全部代码复制并**完全覆盖**里面的默认代码。
+4. 部署完成后，点击 `Edit Code`（编辑代码），将本项目 `_worker.js（可自行选择KV/D1版本）` 中的全部代码复制并**完全覆盖**里面的默认代码。
 5. 点击右上角的 `Deploy`（部署）保存。
 
 ---
