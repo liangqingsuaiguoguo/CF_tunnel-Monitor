@@ -4,10 +4,10 @@
 
 ## ✨ 特性功能
 - ⚡️ **无感秒开**：基于读写分离架构，前端页面毫秒级瞬间加载。
-- 📱 **移动适配**：完美适配手机端单手浏览，支持大盘节点一键折叠与快捷快览。
 - 🔔 **实时告警**：隧道离线或恢复上线时，Telegram 机器人秒级精准推送。
-- 📊 **一键状态**：支持在面板上一键将当前所有隧道的运行简报手动推送到 Telegram。
 - ⏱️ **北京时间**：告警与简报时区精准锁定北京时间，不再有 8 小时时差困扰。
+- 📱 **移动适配**：完美适配手机端单手浏览，支持大盘节点一键折叠与快捷快览。
+- 📊 **一键状态**：支持在面板上一键将当前所有隧道的运行简报手动推送到 Telegram。
 - 🛡️ **智能防呆**：若未配置 Telegram 或 ARGO 隧道，前端按钮会自动变灰并显示“TG未配置”或“隧道未配置”。
 
 ---
@@ -21,8 +21,8 @@
 4. 部署完成后，点击 `Edit Code`（编辑代码），将本项目 `index.js` 中的全部代码复制并**完全覆盖**里面的默认代码。
 5. 点击右上角的 `Deploy`（部署）保存。
 
-### 第二步：创建并绑定 KV 数据库
-由于监控需要记录历史在线率（24小时绿红格子热力图），必须绑定一个 KV 数据库：
+### 第二步：创建并绑定 KV/D1 数据库
+（KV版本）由于监控需要记录历史在线率（24小时绿红格子热力图），必须绑定一个 KV 数据库：
 1. 回到 Cloudflare 主控制台，点击左侧菜单的 `KV`。
 2. 点击 `Create a Namespace`（创建命名空间），输入名字：`tunnel_monitor`，点击添加。
 3. 回到你刚才创建的 Worker 页面，点击 `Settings`（设置）选项卡 -> 选择 `Bindings`（绑定）。
@@ -30,6 +30,17 @@
    - **Variable name（变量名称）**：必须**大写**填入 `KV`
    - **KV namespace（KV 命名空间）**：下拉菜单选择你刚才创建的 `tunnel_monitor`
 5. 点击保存。
+   
+（D1版本）如果节点数量较多，确实会产生非常庞大的 KV 写入量，而 D1拥有极高的写入额度：
+1. 登录 Cloudflare 控制台，在左侧菜单进入 Storage & Databases -> D1。
+2. 点击 Create database（创建数据库），起名为 tunnel_monitor。
+3. 点击进入你刚刚创建的 tunnel_monitor 数据库，找到 Console（控制台）或者 Execute Statement。
+4. 将以下 SQL 语句复制进去并点击执行（如果是本地 Wrangler 部署，也可以保存为 schema.sql 后执行命令）：
+   CREATE TABLE IF NOT EXISTS tunnel_status (name TEXT PRIMARY KEY, domain TEXT, online INTEGER, status_code INTEGER, timestamp INTEGER); CREATE TABLE IF NOT EXISTS tunnel_history (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, online INTEGER, timestamp INTEGER); CREATE INDEX IF NOT EXISTS idx_history_name_time ON tunnel_history(name, timestamp); CREATE TABLE IF NOT EXISTS tunnel_notify (name TEXT PRIMARY KEY, status TEXT);
+5. 绑定 D1 到你的 Worker，进入 Settings（设置） -> Bindings（绑定）。
+   点击 Add 按钮，选择 D1 database binding：
+   Variable name（变量名称）：必须大写填入 DB
+6. 下拉菜单选择你刚才创建的 tunnel_monitor，点击保存并部署。
 
 ### 第三步：配置环境变量 (Variables)
 在 Worker 页面的 `Settings`（设置）选项卡中，选择 `Variables`（变量），点击 `Add Variable`（添加变量）配置以下内容：
