@@ -1,13 +1,45 @@
 // ========================================
-// Cloudflare Tunnel Monitor (KV Edition)
-// Version: 2.0-KV (Storage Backend: Cloudflare KV)
-// KV Binding Variable Name: KV
+// Cloudflare Tunnel Monitor
+// Version: 2.0 (UI Refined & TG Report Standardized)
+// D1 Binding Variable Name: DB
 // ========================================
 
 const ONLINE_CODES = [200, 301, 302, 403, 404, 502, 521, 522];
 
-function getKV(env) {
-  return env.KV || env.MONITOR_KV || null;
+// 数据库自动建表防护
+async function initDatabase(db) {
+  if (!db) return;
+  try {
+    await db.batch([
+      db.prepare(`CREATE TABLE IF NOT EXISTS tunnels_config (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE,
+        domain TEXT,
+        created_at INTEGER
+      )`),
+      db.prepare(`CREATE TABLE IF NOT EXISTS tunnel_status (
+        name TEXT PRIMARY KEY,
+        domain TEXT,
+        online INTEGER,
+        status_code INTEGER,
+        timestamp INTEGER
+      )`),
+      db.prepare(`CREATE TABLE IF NOT EXISTS tunnel_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        online INTEGER,
+        duration INTEGER,
+        timestamp INTEGER
+      )`),
+      db.prepare(`CREATE TABLE IF NOT EXISTS tunnel_notify (
+        name TEXT PRIMARY KEY,
+        status TEXT
+      )`),
+      db.prepare(`CREATE INDEX IF NOT EXISTS idx_history_name_time ON tunnel_history(name, timestamp)`)
+    ]);
+  } catch (e) {
+    console.error("数据库初始化异常", e);
+  }
 }
 
 function getArgoEnv(env) {
@@ -63,25 +95,23 @@ async function getMergedTunnels(env) {
   const envTunnels = parseArgoConfig(getArgoEnv(env));
   const envNames = new Set(envTunnels.map(t => t.name));
 
-  const kvTunnels = [];
-  const kv = getKV(env);
-  if (kv) {
+  const d1Tunnels = [];
+  if (env.DB) {
     try {
-      const configStr = await kv.get("cfg_tunnels");
-      if (configStr) {
-        const items = JSON.parse(configStr);
-        items.forEach(item => {
+      const { results } = await env.DB.prepare(`SELECT id, name, domain FROM tunnels_config ORDER BY id ASC`).all();
+      if (results) {
+        results.forEach(item => {
           if (!envNames.has(item.name)) {
-            kvTunnels.push({ name: item.name, domain: item.domain, isEnv: false });
+            d1Tunnels.push({ name: item.name, domain: item.domain, isEnv: false });
           }
         });
       }
     } catch (e) {
-      console.error("KV 配置读取异常", e);
+      console.error("D1 配置读取避险捕获", e);
     }
   }
 
-  return [...envTunnels, ...kvTunnels];
+  return [...envTunnels, ...d1Tunnels];
 }
 
 async function sendTelegram(env, message) {
@@ -110,7 +140,7 @@ async function checkTunnel(domain) {
     const resp = await fetch(`https://${domain}`, {
       method: "GET",
       redirect: "manual",
-      headers: { "User-Agent": "TunnelMonitor/6.4-KV" }
+      headers: { "User-Agent": "TunnelMonitor/6.4" }
     });
     return {
       online: ONLINE_CODES.includes(resp.status),
@@ -127,63 +157,61 @@ async function checkTunnel(domain) {
   }
 }
 
-async function processTunnel(env, kv, tunnel) {
-  if (!kv) return;
+async function processTunnel(env, db, tunnel) {
   const result = await checkTunnel(tunnel.domain);
   const onlineInt = result.online ? 1 : 0;
   const now = Date.now();
 
-  // 1. 更新节点最新状态
-  await kv.put(`status:${tunnel.name}`, JSON.stringify({
-    domain: tunnel.domain,
-    online: onlineInt,
-    statusCode: result.statusCode,
-    timestamp: now
-  }));
+  await db.prepare(`
+    INSERT INTO tunnel_status (name, domain, online, status_code, timestamp)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(name) DO UPDATE SET
+      domain=excluded.domain,
+      online=excluded.online,
+      status_code=excluded.status_code,
+      timestamp=excluded.timestamp
+  `).bind(tunnel.name, tunnel.domain, onlineInt, result.statusCode, now).run();
 
-  // 2. 更新历史记录 (保留近 30 天)
-  const historyKey = `history:${tunnel.name}`;
-  const rawHistory = await kv.get(historyKey);
-  let history = rawHistory ? JSON.parse(rawHistory) : [];
+  await db.prepare(`
+    INSERT INTO tunnel_history (name, online, duration, timestamp) VALUES (?, ?, 60, ?)
+  `).bind(tunnel.name, onlineInt, now).run();
 
-  history.push({ online: onlineInt, timestamp: now });
   const thirtyDaysAgo = now - 30 * 24 * 60 * 60 * 1000;
-  history = history.filter(item => item.timestamp >= thirtyDaysAgo);
-  await kv.put(historyKey, JSON.stringify(history));
+  await db.prepare(`DELETE FROM tunnel_history WHERE timestamp < ?`).bind(thirtyDaysAgo).run();
 
-  // 3. 告警推送与状态切换检测
-  const notifyKey = `notify:${tunnel.name}`;
-  const notified = await kv.get(notifyKey);
+  const notifyRow = await db.prepare(`SELECT status FROM tunnel_notify WHERE name = ?`).bind(tunnel.name).first();
+  const notified = notifyRow ? notifyRow.status : null;
 
   if (!result.online && notified !== "offline") {
     await sendTelegram(env, `❌ <b>${tunnel.name} 离线告警</b>\n\n🌐 域名：<code>${tunnel.domain}</code>\nHTTP 状态：<code>${result.statusCode || "连接超时/失败"}</code>\n发生时间：${getBeijingTimeString(now)}`);
-    await kv.put(notifyKey, "offline");
+    await db.prepare(`INSERT INTO tunnel_notify (name, status) VALUES (?, 'offline') ON CONFLICT(name) DO UPDATE SET status='offline'`).bind(tunnel.name).run();
   }
 
   if (result.online && notified === "offline") {
     await sendTelegram(env, `✅ <b>${tunnel.name} 恢复运行</b>\n\n🌐 域名：<code>${tunnel.domain}</code>\nHTTP 状态：<code>${result.statusCode}</code>\n恢复时间：${getBeijingTimeString(now)}`);
-    await kv.put(notifyKey, "online");
+    await db.prepare(`INSERT INTO tunnel_notify (name, status) VALUES (?, 'online') ON CONFLICT(name) DO UPDATE SET status='online'`).bind(tunnel.name).run();
   }
 }
 
-async function computeMetricsKV(kv, name, isCurrentlyOnline) {
+async function computeMetrics(db, name, isCurrentlyOnline) {
   const now = Date.now();
   let healthyText = "0天0小时";
   let offlineDurationText = "0分钟";
   let isZeroMinOffline = false;
 
   try {
-    const rawHistory = await kv.get(`history:${name}`);
-    const history = rawHistory ? JSON.parse(rawHistory) : [];
-    history.sort((a, b) => a.timestamp - b.timestamp);
-
     if (isCurrentlyOnline) {
-      const offlineRecords = history.filter(r => r.online === 0);
-      const lastOffline = offlineRecords.length > 0 ? offlineRecords[offlineRecords.length - 1] : null;
+      const lastOffline = await db.prepare(`
+        SELECT timestamp FROM tunnel_history 
+        WHERE name = ? AND online = 0 
+        ORDER BY timestamp DESC LIMIT 1
+      `).bind(name).first();
 
       let uptimeStart = lastOffline ? lastOffline.timestamp : (now - 30 * 24 * 3600 * 1000);
-      const firstRecord = history[0];
-
+      const firstRecord = await db.prepare(`
+        SELECT timestamp FROM tunnel_history WHERE name = ? ORDER BY timestamp ASC LIMIT 1
+      `).bind(name).first();
+      
       if (firstRecord && firstRecord.timestamp > uptimeStart) {
         uptimeStart = firstRecord.timestamp;
       }
@@ -194,8 +222,11 @@ async function computeMetricsKV(kv, name, isCurrentlyOnline) {
       const hours = totalHours % 24;
       healthyText = `${days}天${hours}小时`;
     } else {
-      const onlineRecords = history.filter(r => r.online === 1);
-      const lastOnline = onlineRecords.length > 0 ? onlineRecords[onlineRecords.length - 1] : null;
+      const lastOnline = await db.prepare(`
+        SELECT timestamp FROM tunnel_history 
+        WHERE name = ? AND online = 1 
+        ORDER BY timestamp DESC LIMIT 1
+      `).bind(name).first();
 
       if (!lastOnline) {
         isZeroMinOffline = true;
@@ -209,9 +240,12 @@ async function computeMetricsKV(kv, name, isCurrentlyOnline) {
       }
     }
 
-    // 24小时打卡点计算
     const twentyFourHoursAgo = now - 24 * 60 * 60 * 1000;
-    const recentHistory = history.filter(r => r.timestamp >= twentyFourHoursAgo);
+    const recentHistory = await db.prepare(`
+      SELECT online, timestamp FROM tunnel_history 
+      WHERE name = ? AND timestamp >= ? 
+      ORDER BY timestamp ASC
+    `).bind(name, twentyFourHoursAgo).all();
 
     const hourlyDots = [];
     const currentHourStart = new Date().setMinutes(0, 0, 0);
@@ -219,7 +253,7 @@ async function computeMetricsKV(kv, name, isCurrentlyOnline) {
     for (let i = 23; i >= 0; i--) {
       const slotStart = currentHourStart - i * 3600 * 1000;
       const slotEnd = slotStart + 3600 * 1000;
-      const recordsInSlot = recentHistory.filter(r => r.timestamp >= slotStart && r.timestamp < slotEnd);
+      const recordsInSlot = (recentHistory.results || []).filter(r => r.timestamp >= slotStart && r.timestamp < slotEnd);
 
       if (recordsInSlot.length === 0) {
         hourlyDots.push("⚪");
@@ -235,16 +269,20 @@ async function computeMetricsKV(kv, name, isCurrentlyOnline) {
       }
     }
 
-    // 近30天数据统计
     const thirtyDaysAgo = now - 30 * 24 * 60 * 60 * 1000;
-    const monthHistory = history.filter(r => r.timestamp >= thirtyDaysAgo);
+    const monthHistory = await db.prepare(`
+      SELECT online, timestamp FROM tunnel_history 
+      WHERE name = ? AND timestamp >= ? 
+      ORDER BY timestamp ASC
+    `).bind(name, thirtyDaysAgo).all();
 
+    const mRecords = monthHistory.results || [];
     let offlineIncidents = 0;
     let offlineMinutes = 0;
     let inOfflineState = false;
 
-    for (let i = 0; i < monthHistory.length; i++) {
-      if (monthHistory[i].online === 0) {
+    for (let i = 0; i < mRecords.length; i++) {
+      if (mRecords[i].online === 0) {
         offlineMinutes++;
         if (!inOfflineState) {
           offlineIncidents++;
@@ -255,9 +293,9 @@ async function computeMetricsKV(kv, name, isCurrentlyOnline) {
       }
     }
 
-    const totalMonitoredMin = monthHistory.length;
+    const totalMonitoredMin = mRecords.length;
     const onlineMinutes = Math.max(0, totalMonitoredMin - offlineMinutes);
-
+    
     return {
       healthyText,
       offlineDurationText,
@@ -283,7 +321,7 @@ async function computeMetricsKV(kv, name, isCurrentlyOnline) {
 }
 
 // ========================================
-// 前端 HTML UI
+// 前端 HTML
 // ========================================
 function getFrontendHTML(hasTunnels, hasTelegram) {
   return `<!DOCTYPE html>
@@ -291,7 +329,7 @@ function getFrontendHTML(hasTunnels, hasTelegram) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
-<title>Cloudflare Tunnel Monitor (KV)</title>
+<title>Cloudflare Tunnel Monitor</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='45' fill='%230f172a'/><polygon points='50,15 85,35 85,65 50,85 15,65 15,35' fill='none' stroke='%2338bdf8' stroke-width='6'/><circle cx='50' cy='50' r='14' fill='%2322c55e'/><path d='M50 15 L50 36 M85 35 L64 43 M85 65 L64 57 M50 85 L50 64 M15 65 L36 57 M15 35 L36 43' stroke='%2338bdf8' stroke-width='4'/></svg>">
 <style>
 :root {
@@ -527,7 +565,7 @@ button:hover{ opacity: 0.9; transform: translateY(-1px); }
   font-weight: bold;
 }
 
-/* 需求2：自适应打卡点容器 */
+/* 需求2：自适应打卡点容器，手机端压缩单行完整显示，电脑端拉满 */
 .dot-container-wrapper{ margin-top: 10px; width: 100%; }
 .dot-title{ font-size: 11px; color: var(--text-sub); margin-bottom: 6px; display: flex; justify-content: space-between; }
 .dot-bar{
@@ -661,7 +699,7 @@ tr.dragging{ opacity: 0.4; background: rgba(37, 99, 235, 0.2); }
     <div class="pulse-badge-container">
       <div class="pulse-badge">
         <span class="pulse-dot"></span>
-        正在监控 (KV版本)
+        正在监控（D1）
       </div>
     </div>
     <p>隧道在线状态与多维度健康检测面板</p>
@@ -706,7 +744,7 @@ tr.dragging{ opacity: 0.4; background: rgba(37, 99, 235, 0.2); }
 <!-- 配置弹窗 -->
 <div class="modal" id="configModal">
   <div class="modal-content">
-    <h3>配置隧道节点 (KV 存储)</h3>
+    <h3>配置隧道节点 (D1 数据库)</h3>
     <div id="authSection">
       <input type="password" id="adminPass" placeholder="请输入管理员密码解锁配置">
       <button class="primary" style="width:100%" onclick="verifyAndLoadConfig()">解锁配置</button>
@@ -837,11 +875,13 @@ async function loadDataAndRender(isManual = false){
                 </div>
               \`}
 
+              <!-- 需求1：分行高亮格式改进 -->
               <div class="metrics-30d">
                 📊 近30天中，隧道健康运行 <span class="green-text">\${v.monthMetrics.days}天\${v.monthMetrics.hours}小时</span><br>
                 中断 <span class="red-text">\${v.monthMetrics.incidents}</span> 次，累计中断 <span class="red-text">\${v.monthMetrics.offHours}小时\${v.monthMetrics.offMin}分钟</span>
               </div>
 
+              <!-- 需求2：修改文案为 24小时隧道监控 (00:00 - 24:00) -->
               <div class="dot-container-wrapper">
                 <div class="dot-title"><span>24小时隧道监控 (00:00 - 24:00)</span><span>最近 &rarr;</span></div>
                 <div class="dot-bar">\${dotsHtml}</div>
@@ -1076,11 +1116,13 @@ function maskDomain(domain) {
 }
 
 // ========================================
-// Worker 主入口与路由响应 (KV 版)
+// Worker 主入口与后端 API 路由分发
 // ========================================
 export default {
   async fetch(request, env, ctx) {
-    const kv = getKV(env);
+    if (env.DB) {
+      await initDatabase(env.DB);
+    }
     const config = getConfig(env);
     const url = new URL(request.url);
 
@@ -1093,24 +1135,18 @@ export default {
       });
     }
 
-    // 2. 节点状态获取 API
+    // 2. 状态获取 API
     if (url.pathname === "/status") {
       const tunnels = await getMergedTunnels(env);
       
       const resultItems = await Promise.all(tunnels.map(async (t) => {
-        let isOnline = false;
-        let statusCode = 0;
-
-        if (kv) {
-          const rawStatus = await kv.get(`status:${t.name}`);
-          if (rawStatus) {
-            try {
-              const statusData = JSON.parse(rawStatus);
-              isOnline = Boolean(statusData.online);
-              statusCode = statusData.statusCode || 0;
-            } catch(e){}
-          }
+        let statusRow = null;
+        if (env.DB) {
+          statusRow = await env.DB.prepare(`SELECT online, status_code FROM tunnel_status WHERE name = ?`).bind(t.name).first();
         }
+
+        const isOnline = statusRow ? Boolean(statusRow.online) : false;
+        const statusCode = statusRow ? statusRow.status_code : 0;
 
         let metrics = {
           healthyText: "0天0小时",
@@ -1120,8 +1156,8 @@ export default {
           monthMetrics: { days: 0, hours: 0, incidents: 0, offHours: 0, offMin: 0 }
         };
 
-        if (kv) {
-          metrics = await computeMetricsKV(kv, t.name, isOnline);
+        if (env.DB) {
+          metrics = await computeMetrics(env.DB, t.name, isOnline);
         }
 
         return {
@@ -1144,7 +1180,7 @@ export default {
       }), { headers: { "content-type": "application/json" } });
     }
 
-    // 3. 解锁验证并获取完整配置
+    // 3. 校验密码并获取完整配置
     if (url.pathname === "/api/get-config") {
       const pass = url.searchParams.get("pass");
       if (pass !== config.ADMIN_PASS) {
@@ -1155,7 +1191,7 @@ export default {
       return new Response(JSON.stringify({ success: true, tunnels }), { headers: { "content-type": "application/json" } });
     }
 
-    // 4. 保存 KV 节点配置
+    // 4. 保存 D1 表单配置
     if (url.pathname === "/api/save-table-config" && request.method === "POST") {
       try {
         const body = await request.json();
@@ -1163,11 +1199,16 @@ export default {
           return new Response(JSON.stringify({ success: false, error: "密码错误" }), { status: 403, headers: { "content-type": "application/json" } });
         }
 
-        if (!kv) {
-          return new Response(JSON.stringify({ success: false, error: "未绑定 KV 命名空间" }), { headers: { "content-type": "application/json" } });
+        if (!env.DB) {
+          return new Response(JSON.stringify({ success: false, error: "未绑定 D1 数据库" }), { headers: { "content-type": "application/json" } });
         }
 
-        await kv.put("cfg_tunnels", JSON.stringify(body.items || []));
+        await env.DB.prepare(`DELETE FROM tunnels_config`).run();
+
+        const now = Date.now();
+        for (const item of (body.items || [])) {
+          await env.DB.prepare(`INSERT INTO tunnels_config (name, domain, created_at) VALUES (?, ?, ?)`).bind(item.name, item.domain, now).run();
+        }
 
         return new Response(JSON.stringify({ success: true }), { headers: { "content-type": "application/json" } });
       } catch (e) {
@@ -1175,7 +1216,7 @@ export default {
       }
     }
 
-    // 5. 手动推送 Telegram 全盘巡检诊断报告
+    // 5. 需求3：手动 Telegram 推送 - 恢复全盘诊断报告排版格式
     if (url.pathname === "/push-status" && request.method === "POST") {
       const tunnels = await getMergedTunnels(env);
       if (tunnels.length === 0) {
@@ -1187,24 +1228,19 @@ export default {
       const offlineDetails = [];
 
       for (const t of tunnels) {
-        let isOnline = false;
-        if (kv) {
-          const rawStatus = await kv.get(`status:${t.name}`);
-          if (rawStatus) {
-            try {
-              const statusData = JSON.parse(rawStatus);
-              isOnline = Boolean(statusData.online);
-            } catch(e){}
-          }
+        let statusRow = null;
+        if (env.DB) {
+          statusRow = await env.DB.prepare(`SELECT online, status_code FROM tunnel_status WHERE name = ?`).bind(t.name).first();
         }
-
+        const isOnline = statusRow ? Boolean(statusRow.online) : false;
+        
         if (isOnline) {
           onlineCount++;
         } else {
           offlineCount++;
           let metrics = { offlineDurationText: "0分钟", isZeroMinOffline: true };
-          if (kv) {
-            metrics = await computeMetricsKV(kv, t.name, false);
+          if (env.DB) {
+            metrics = await computeMetrics(env.DB, t.name, false);
           }
 
           offlineDetails.push({
@@ -1246,13 +1282,13 @@ export default {
     return new Response("Not Found", { status: 404 });
   },
 
-  // 6. Cron 定时巡检任务入口
+  // 6. Cron 定时计划任务入口
   async scheduled(event, env, ctx) {
-    const kv = getKV(env);
-    if (!kv) return;
+    if (!env.DB) return;
+    await initDatabase(env.DB);
     const tunnels = await getMergedTunnels(env);
     for (const tunnel of tunnels) {
-      ctx.waitUntil(processTunnel(env, kv, tunnel));
+      ctx.waitUntil(processTunnel(env, env.DB, tunnel));
     }
   }
 };
