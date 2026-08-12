@@ -1,21 +1,35 @@
 // ========================================
-// Cloudflare Tunnel Monitor
-// Version: 1.0 (Beijing Time & Intelligent Button Status)
-// KV Namespace Variable Name: KV
+// Cloudflare Tunnel Monitor (KV Edition)
+// Version: 2.0-KV (Storage Backend: Cloudflare KV)
+// KV Binding Variable Name: KV
 // ========================================
 
 const ONLINE_CODES = [200, 301, 302, 403, 404, 502, 521, 522];
 
+function getKV(env) {
+  return env.KV || env.MONITOR_KV || null;
+}
+
+function getArgoEnv(env) {
+  if (!env) return "";
+  for (const key of Object.keys(env)) {
+    if (key.toLowerCase() === "argo") {
+      return env[key] || "";
+    }
+  }
+  return "";
+}
+
 function getConfig(env) {
   return {
-    ARGO: env.ARGO || env.argo || "", 
+    ARGO: getArgoEnv(env), 
     BOT_TOKEN: env.BOT_TOKEN || "",
-    CHAT_ID: env.CHAT_ID || ""
+    CHAT_ID: env.CHAT_ID || "",
+    ADMIN_PASS: env.ADMIN_PASS || "admin123"
   };
 }
 
-// 统一获取北京时间的字符串
-function getBeijingTimeString() {
+function getBeijingTimeString(ts = Date.now()) {
   return new Intl.DateTimeFormat("zh-CN", {
     timeZone: "Asia/Shanghai",
     year: "numeric",
@@ -25,27 +39,51 @@ function getBeijingTimeString() {
     minute: "2-digit",
     second: "2-digit",
     hour12: false
-  }).format(new Date());
+  }).format(new Date(ts));
 }
 
-// 解析节点
 function parseArgoConfig(text) {
   if (!text) return [];
   return text
-    .split("\n")
+    .split(/[\n;]/)
     .map(v => v.trim())
     .filter(Boolean)
     .map(line => {
       const parts = line.split("-----");
       return {
         name: parts[0]?.trim(),
-        domain: parts[1]?.trim()
+        domain: parts[1]?.trim(),
+        isEnv: true
       };
     })
     .filter(v => v.name && v.domain);
 }
 
-// Telegram 发送通知
+async function getMergedTunnels(env) {
+  const envTunnels = parseArgoConfig(getArgoEnv(env));
+  const envNames = new Set(envTunnels.map(t => t.name));
+
+  const kvTunnels = [];
+  const kv = getKV(env);
+  if (kv) {
+    try {
+      const configStr = await kv.get("cfg_tunnels");
+      if (configStr) {
+        const items = JSON.parse(configStr);
+        items.forEach(item => {
+          if (!envNames.has(item.name)) {
+            kvTunnels.push({ name: item.name, domain: item.domain, isEnv: false });
+          }
+        });
+      }
+    } catch (e) {
+      console.error("KV 配置读取异常", e);
+    }
+  }
+
+  return [...envTunnels, ...kvTunnels];
+}
+
 async function sendTelegram(env, message) {
   if (!env.BOT_TOKEN || !env.CHAT_ID) return false;
   try {
@@ -67,13 +105,12 @@ async function sendTelegram(env, message) {
   }
 }
 
-// 检查单个隧道
 async function checkTunnel(domain) {
   try {
     const resp = await fetch(`https://${domain}`, {
       method: "GET",
       redirect: "manual",
-      headers: { "User-Agent": "TunnelMonitor/2.0" }
+      headers: { "User-Agent": "TunnelMonitor/6.4-KV" }
     });
     return {
       online: ONLINE_CODES.includes(resp.status),
@@ -90,68 +127,163 @@ async function checkTunnel(domain) {
   }
 }
 
-// KV 键名定义
-const statusKey = name => `status:${name}`;
-const historyKey = name => `history:${name}`;
-const notifyKey = name => `notify:${name}`;
-
-// 获取历史
-async function getHistory(kv, name) {
-  const raw = await kv.get(historyKey(name));
-  if (!raw) return [];
-  try { return JSON.parse(raw); } catch { return []; }
-}
-
-// 保存历史记录
-async function saveHistory(kv, name, online) {
-  let history = await getHistory(kv, name);
-  history.push({ t: Date.now(), s: online ? 1 : 0 });
-  if (history.length > 168) history = history.slice(-168); 
-  await kv.put(historyKey(name), JSON.stringify(history));
-  return history;
-}
-
-function calculateUptime(history) {
-  if (!history.length) return "100.0";
-  const online = history.filter(v => v.s === 1).length;
-  return ((online / history.length) * 100).toFixed(1);
-}
-
-function buildHeatmap(history) {
-  if (!history.length) return "⬜";
-  return history.map(h => (h.s ? "🟩" : "🟥")).join("");
-}
-
-// 执行探测并更新状态
 async function processTunnel(env, kv, tunnel) {
+  if (!kv) return;
   const result = await checkTunnel(tunnel.domain);
-  
-  await kv.put(statusKey(tunnel.name), JSON.stringify(result));
-  const history = await saveHistory(kv, tunnel.name, result.online);
-  const notified = await kv.get(notifyKey(tunnel.name));
+  const onlineInt = result.online ? 1 : 0;
+  const now = Date.now();
+
+  // 1. 更新节点最新状态
+  await kv.put(`status:${tunnel.name}`, JSON.stringify({
+    domain: tunnel.domain,
+    online: onlineInt,
+    statusCode: result.statusCode,
+    timestamp: now
+  }));
+
+  // 2. 更新历史记录 (保留近 30 天)
+  const historyKey = `history:${tunnel.name}`;
+  const rawHistory = await kv.get(historyKey);
+  let history = rawHistory ? JSON.parse(rawHistory) : [];
+
+  history.push({ online: onlineInt, timestamp: now });
+  const thirtyDaysAgo = now - 30 * 24 * 60 * 60 * 1000;
+  history = history.filter(item => item.timestamp >= thirtyDaysAgo);
+  await kv.put(historyKey, JSON.stringify(history));
+
+  // 3. 告警推送与状态切换检测
+  const notifyKey = `notify:${tunnel.name}`;
+  const notified = await kv.get(notifyKey);
 
   if (!result.online && notified !== "offline") {
-    await sendTelegram(env, `❌ <b>${tunnel.name} 离线告警</b>\n\n🌐 ${tunnel.domain}\n\n状态码：<code>${result.statusCode || "连接失败"}</code>\n\n时间：${getBeijingTimeString()}`);
-    await kv.put(notifyKey(tunnel.name), "offline");
+    await sendTelegram(env, `❌ <b>${tunnel.name} 离线告警</b>\n\n🌐 域名：<code>${tunnel.domain}</code>\nHTTP 状态：<code>${result.statusCode || "连接超时/失败"}</code>\n发生时间：${getBeijingTimeString(now)}`);
+    await kv.put(notifyKey, "offline");
   }
 
   if (result.online && notified === "offline") {
-    await sendTelegram(env, `✅ <b>${tunnel.name} 已恢复上线</b>\n\n🌐 ${tunnel.domain}\n\n状态：<code>${result.statusCode}</code>\n\n时间：${getBeijingTimeString()}`);
-    await kv.put(notifyKey(tunnel.name), "online");
+    await sendTelegram(env, `✅ <b>${tunnel.name} 恢复运行</b>\n\n🌐 域名：<code>${tunnel.domain}</code>\nHTTP 状态：<code>${result.statusCode}</code>\n恢复时间：${getBeijingTimeString(now)}`);
+    await kv.put(notifyKey, "online");
   }
+}
 
-  return {
-    name: tunnel.name,
-    domain: tunnel.domain,
-    online: result.online,
-    statusCode: result.statusCode,
-    uptime: calculateUptime(history),
-    heat: buildHeatmap(history)
-  };
+async function computeMetricsKV(kv, name, isCurrentlyOnline) {
+  const now = Date.now();
+  let healthyText = "0天0小时";
+  let offlineDurationText = "0分钟";
+  let isZeroMinOffline = false;
+
+  try {
+    const rawHistory = await kv.get(`history:${name}`);
+    const history = rawHistory ? JSON.parse(rawHistory) : [];
+    history.sort((a, b) => a.timestamp - b.timestamp);
+
+    if (isCurrentlyOnline) {
+      const offlineRecords = history.filter(r => r.online === 0);
+      const lastOffline = offlineRecords.length > 0 ? offlineRecords[offlineRecords.length - 1] : null;
+
+      let uptimeStart = lastOffline ? lastOffline.timestamp : (now - 30 * 24 * 3600 * 1000);
+      const firstRecord = history[0];
+
+      if (firstRecord && firstRecord.timestamp > uptimeStart) {
+        uptimeStart = firstRecord.timestamp;
+      }
+
+      const diffMs = Math.max(0, now - uptimeStart);
+      const totalHours = Math.floor(diffMs / (1000 * 60 * 60));
+      const days = Math.floor(totalHours / 24);
+      const hours = totalHours % 24;
+      healthyText = `${days}天${hours}小时`;
+    } else {
+      const onlineRecords = history.filter(r => r.online === 1);
+      const lastOnline = onlineRecords.length > 0 ? onlineRecords[onlineRecords.length - 1] : null;
+
+      if (!lastOnline) {
+        isZeroMinOffline = true;
+      } else {
+        const offDiffMs = Math.max(0, now - lastOnline.timestamp);
+        const offTotalMin = Math.floor(offDiffMs / (1000 * 60));
+        if (offTotalMin === 0) isZeroMinOffline = true;
+        const offHours = Math.floor(offTotalMin / 60);
+        const offMin = offTotalMin % 60;
+        offlineDurationText = offHours > 0 ? `${offHours}小时${offMin}分钟` : `${offMin}分钟`;
+      }
+    }
+
+    // 24小时打卡点计算
+    const twentyFourHoursAgo = now - 24 * 60 * 60 * 1000;
+    const recentHistory = history.filter(r => r.timestamp >= twentyFourHoursAgo);
+
+    const hourlyDots = [];
+    const currentHourStart = new Date().setMinutes(0, 0, 0);
+
+    for (let i = 23; i >= 0; i--) {
+      const slotStart = currentHourStart - i * 3600 * 1000;
+      const slotEnd = slotStart + 3600 * 1000;
+      const recordsInSlot = recentHistory.filter(r => r.timestamp >= slotStart && r.timestamp < slotEnd);
+
+      if (recordsInSlot.length === 0) {
+        hourlyDots.push("⚪");
+      } else {
+        const offlineCount = recordsInSlot.filter(r => r.online === 0).length;
+        if (offlineCount > 10) {
+          hourlyDots.push("🔴");
+        } else if (offlineCount >= 5) {
+          hourlyDots.push("🟡");
+        } else {
+          hourlyDots.push("🟢");
+        }
+      }
+    }
+
+    // 近30天数据统计
+    const thirtyDaysAgo = now - 30 * 24 * 60 * 60 * 1000;
+    const monthHistory = history.filter(r => r.timestamp >= thirtyDaysAgo);
+
+    let offlineIncidents = 0;
+    let offlineMinutes = 0;
+    let inOfflineState = false;
+
+    for (let i = 0; i < monthHistory.length; i++) {
+      if (monthHistory[i].online === 0) {
+        offlineMinutes++;
+        if (!inOfflineState) {
+          offlineIncidents++;
+          inOfflineState = true;
+        }
+      } else {
+        inOfflineState = false;
+      }
+    }
+
+    const totalMonitoredMin = monthHistory.length;
+    const onlineMinutes = Math.max(0, totalMonitoredMin - offlineMinutes);
+
+    return {
+      healthyText,
+      offlineDurationText,
+      isZeroMinOffline,
+      dots: hourlyDots,
+      monthMetrics: {
+        days: Math.floor(onlineMinutes / (60 * 24)),
+        hours: Math.floor((onlineMinutes % (60 * 24)) / 60),
+        incidents: offlineIncidents,
+        offHours: Math.floor(offlineMinutes / 60),
+        offMin: offlineMinutes % 60
+      }
+    };
+  } catch (e) {
+    return {
+      healthyText: "0天0小时",
+      offlineDurationText: "0分钟",
+      isZeroMinOffline: true,
+      dots: Array(24).fill("⚪"),
+      monthMetrics: { days: 0, hours: 0, incidents: 0, offHours: 0, offMin: 0 }
+    };
+  }
 }
 
 // ========================================
-// 前端页面 HTML (新增时区锁定与状态防呆按钮)
+// 前端 HTML UI
 // ========================================
 function getFrontendHTML(hasTunnels, hasTelegram) {
   return `<!DOCTYPE html>
@@ -159,355 +291,968 @@ function getFrontendHTML(hasTunnels, hasTelegram) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
-<title>Cloudflare Tunnel Monitor</title>
+<title>Cloudflare Tunnel Monitor (KV)</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='45' fill='%230f172a'/><polygon points='50,15 85,35 85,65 50,85 15,65 15,35' fill='none' stroke='%2338bdf8' stroke-width='6'/><circle cx='50' cy='50' r='14' fill='%2322c55e'/><path d='M50 15 L50 36 M85 35 L64 43 M85 65 L64 57 M50 85 L50 64 M15 65 L36 57 M15 35 L36 43' stroke='%2338bdf8' stroke-width='4'/></svg>">
 <style>
+:root {
+  --bg-color: #f1f5f9;
+  --card-bg: rgba(255, 255, 255, 0.88);
+  --border-color: #e2e8f0;
+  --text-main: #0f172a;
+  --text-sub: #64748b;
+  --header-bg: #ffffff;
+  --tunnel-bg: #ffffff;
+  --modal-bg: #ffffff;
+  --input-bg: #f8fafc;
+  --dot-bg: #f8fafc;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-color: #0f172a;
+    --card-bg: rgba(30, 41, 59, 0.7);
+    --border-color: rgba(255, 255, 255, 0.12);
+    --text-main: #f8fafc;
+    --text-sub: #94a3b8;
+    --header-bg: rgba(15, 23, 42, 0.5);
+    --tunnel-bg: rgba(255, 255, 255, 0.03);
+    --modal-bg: #1e293b;
+    --input-bg: rgba(15, 23, 42, 0.6);
+    --dot-bg: rgba(15, 23, 42, 0.6);
+  }
+}
+
 *{margin:0;padding:0;box-sizing:border-box;}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f3f5f7;padding:15px;color:#333;}
-.container{max-width:1000px;margin:auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 10px 30px rgba(0,0,0,.08);}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",Roboto,sans-serif;
+  background: var(--bg-color);
+  min-height: 100vh;
+  padding: 16px 10px;
+  color: var(--text-main);
+  transition: background 0.3s;
+}
+.container{
+  max-width: 920px;
+  margin: auto;
+  background: var(--card-bg);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border-color);
+  border-radius: 16px;
+  overflow: hidden;
+  box-shadow: 0 20px 40px rgba(0,0,0,0.06);
+}
 
-.header{padding:25px 15px;color:#fff;background:linear-gradient(135deg,#1f2937,#334155);text-align:center;}
-.header h1{font-size:24px;font-weight:700;}
-.header p{margin-top:6px;opacity:.8;font-size:13px;}
+.header{
+  padding: 24px 20px 20px 20px;
+  text-align: center;
+  background: var(--header-bg);
+  border-bottom: 1px solid var(--border-color);
+}
+.header h1{ 
+  font-size: 24px; 
+  font-weight: 800; 
+  color: var(--text-main); 
+  letter-spacing: -0.4px;
+  line-height: 1.2;
+}
 
-.controls{padding:12px 15px;background:#f8fafc;display:flex;gap:10px;flex-wrap:wrap;}
-button{padding:10px 16px;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:600;transition: opacity 0.2s;flex:1;min-width:100px;text-align:center;}
-button:hover{opacity:0.9;}
-.primary{background:#2563eb;color:white;}
-.success{background:#16a34a;color:white;}
-button:disabled, button.disabled{background:#cbd5e1 !important;color:#94a3b8 !important;cursor:not-allowed !important;opacity:1 !important;}
+.pulse-badge-container {
+  margin-top: 10px;
+}
+.pulse-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(34, 197, 94, 0.12);
+  border: 1px solid rgba(34, 197, 94, 0.3);
+  padding: 4px 14px;
+  border-radius: 20px;
+  font-size: 13px;
+  font-weight: 700;
+  color: #22c55e;
+}
+.pulse-dot {
+  width: 8px;
+  height: 8px;
+  background-color: #22c55e;
+  border-radius: 50%;
+  box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7);
+  animation: pulse-green 1.8s infinite;
+}
+@keyframes pulse-green {
+  0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7); }
+  70% { transform: scale(1); box-shadow: 0 0 0 7px rgba(34, 197, 94, 0); }
+  100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+}
 
-.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;padding:15px;background:#f8fafc;border-bottom:1px solid #e2e8f0;}
-.card{padding:12px;background:white;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.03);border-left:4px solid #2563eb;text-align:center;}
-.number{font-size:22px;font-weight:bold;}
-.label{margin-top:4px;color:#666;font-size:11px;}
+.header p{ 
+  margin-top: 10px; 
+  color: var(--text-sub); 
+  font-size: 13px; 
+  letter-spacing: 0.2px;
+}
 
-.overview-box{margin:15px;padding:12px;background:#f1f5f9;border-radius:8px;font-size:13px;}
-.overview-title{font-weight:bold;margin-bottom:6px;color:#475569;display:flex;justify-content:space-between;}
-.overview-tags{display:flex;flex-wrap:wrap;gap:6px;}
-.tag-item{padding:3px 8px;background:white;border-radius:4px;border:1px solid #cbd5e1;display:inline-flex;align-items:center;gap:4px;font-size:12px;}
+.controls{
+  padding: 14px 18px;
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+button{
+  padding: 10px 14px;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  transition: all 0.2s ease;
+  flex: 1;
+  min-width: 90px;
+  text-align: center;
+}
+button:hover{ opacity: 0.9; transform: translateY(-1px); }
+.primary{ background: #2563eb; color: #fff; }
+.success{ background: #16a34a; color: #fff; }
+.dark{ background: #475569; color: #fff; }
+.danger{ background: #dc2626; color: #fff; }
 
-.tunnel-list{padding:5px 15px 15px 15px;}
-.tunnel{margin-bottom:12px;border-radius:8px;background:#fff;box-shadow:0 2px 10px rgba(0,0,0,.04);border:1px solid #e2e8f0;overflow:hidden;}
-.online{border-left:5px solid #22c55e;}
-.offline{border-left:5px solid #ef4444;}
+.stats{
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border-color);
+}
+.card{
+  padding: 12px 6px;
+  background: var(--tunnel-bg);
+  border-radius: 10px;
+  border: 1px solid var(--border-color);
+  text-align: center;
+  cursor: pointer;
+  user-select: none;
+  transition: transform 0.15s;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+.card:active{ transform: scale(0.97); }
+.number{ font-size: 22px; font-weight: 700; color: #38bdf8; }
+.label-main{ margin-top: 2px; color: var(--text-main); font-size: 12px; font-weight: 600; }
+.label-sub{ color: var(--text-sub); font-size: 11px; margin-top: 1px; display: block; }
 
-.tunnel-header{padding:14px;background:#fff;display:flex;justify-content:space-between;align-items:center;cursor:pointer;user-select:none;}
-.tunnel-header:hover{background:#f8fafc;}
-.tunnel-title-left h3{font-size:16px;font-weight:700;word-break:break-all;}
-.tunnel-title-left span{font-size:12px;color:#71717a;word-break:break-all;display:block;margin-top:2px;}
-.toggle-status{font-size:12px;color:#2563eb;font-weight:600;background:#eff6ff;padding:2px 8px;border-radius:4px;}
+.tunnel-list{ padding: 16px 18px; }
+.tunnel{
+  margin-bottom: 14px;
+  border-radius: 12px;
+  background: var(--tunnel-bg);
+  border: 1px solid var(--border-color);
+  overflow: hidden;
+}
+.online{ border-left: 5px solid #22c55e; }
+.offline{ border-left: 5px solid #ef4444; }
 
-.tunnel-body{padding:0 14px 14px 14px;border-top:1px dashed #e2e8f0;background:#fafafa;display:none;}
-.tunnel-body.show{display:block;}
+.tunnel-header{
+  padding: 14px 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  cursor: pointer;
+}
+.tunnel-title-left h3{ font-size: 15px; font-weight: 700; color: var(--text-main); }
 
-.status-line{font-size:13px;font-weight:bold;margin:10px 0 6px 0;display:flex;align-items:center;gap:5px;}
-.uptime-line{font-size:13px;color:#444;margin-bottom:10px;}
-.heat{font-size:13px;letter-spacing:1px;line-height:18px;word-break:break-all;background:#fff;padding:8px;border-radius:6px;border:1px solid #f1f5f9;}
+.domain-mask{
+  filter: blur(5px);
+  user-select: none;
+  opacity: 0.7;
+  font-family: monospace;
+  font-size: 12px;
+  color: #2563eb;
+  display: block;
+  margin-top: 3px;
+}
+.domain-clear{
+  filter: none !important;
+  opacity: 1 !important;
+  font-family: monospace;
+  font-size: 12px;
+  color: #2563eb;
+  display: block;
+  margin-top: 3px;
+}
 
-.footer{padding:15px;text-align:center;color:#777;font-size:12px;line-height:1.6;}
+.toggle-status{
+  font-size: 11px;
+  color: #2563eb;
+  background: rgba(37, 99, 235, 0.1);
+  padding: 3px 10px;
+  border-radius: 6px;
+}
+.tunnel-body{
+  padding: 14px 16px;
+  border-top: 1px dashed var(--border-color);
+  display: none;
+}
+.tunnel-body.show{ display: block; }
 
-@media(min-width:600px){
-  body{padding:20px;}
-  .header{padding:35px;}
-  .header h1{font-size:30px;}
-  .header p{font-size:14px;}
-  .stats{gap:15px;padding:20px;}
-  .card{padding:20px;text-align:left;}
-  .number{font-size:32px;}
-  .label{font-size:13px;}
-  button{flex:none;padding:12px 24px;font-size:15px;}
-  .tunnel-header{padding:16px;}
-  .tunnel-title-left h3{font-size:18px;}
-  .tunnel-title-left span{font-size:13px;display:inline;margin-left:10px;}
-  .tunnel-body{padding:0 16px 16px 16px;}
-  .heat{font-size:14px;letter-spacing:2px;line-height:22px;}
+.status-badge{ font-size: 12px; padding: 3px 8px; border-radius: 4px; font-weight: bold; display: inline-block; }
+.healthy-tag{
+  margin: 10px 0;
+  font-size: 13px;
+  color: #16a34a;
+  font-weight: bold;
+  background: rgba(22, 163, 74, 0.1);
+  padding: 8px 12px;
+  border-radius: 8px;
+}
+
+/* 需求1：近30天指标分行样式 */
+.metrics-30d{
+  font-size: 12px;
+  color: var(--text-sub);
+  margin-bottom: 12px;
+  background: var(--tunnel-bg);
+  padding: 10px 12px;
+  border-radius: 8px;
+  line-height: 1.7;
+  border: 1px solid var(--border-color);
+}
+.metrics-30d .green-text {
+  color: #22c55e;
+  font-weight: bold;
+}
+.metrics-30d .red-text {
+  color: #ef4444;
+  font-weight: bold;
+}
+
+/* 需求2：自适应打卡点容器 */
+.dot-container-wrapper{ margin-top: 10px; width: 100%; }
+.dot-title{ font-size: 11px; color: var(--text-sub); margin-bottom: 6px; display: flex; justify-content: space-between; }
+.dot-bar{
+  display: flex;
+  width: 100%;
+  justify-content: space-between;
+  align-items: center;
+  background: var(--dot-bg);
+  padding: 8px 4px;
+  border-radius: 8px;
+  border: 1px solid var(--border-color);
+  overflow: hidden;
+}
+.dot-item{
+  flex: 1 1 0%;
+  min-width: 0;
+  text-align: center;
+  font-size: clamp(8px, 2.7vw, 15px);
+  line-height: 1;
+  user-select: none;
+}
+
+.modal{
+  display: none;
+  position: fixed;
+  top: 0; left: 0; width: 100%; height: 100%;
+  background: rgba(0,0,0,0.6);
+  backdrop-filter: blur(6px);
+  align-items: center;
+  justify-content: center;
+  z-index: 99;
+  padding: 12px;
+}
+.modal-content{
+  background: var(--modal-bg);
+  border: 1px solid var(--border-color);
+  padding: 20px;
+  border-radius: 14px;
+  width: 100%;
+  max-width: 760px;
+  max-height: 90vh;
+  overflow-y: auto;
+  box-shadow: 0 20px 40px rgba(0,0,0,0.3);
+}
+.modal-content h3{ margin-bottom: 14px; font-size: 16px; color: var(--text-main); }
+.modal-content input{
+  width: 100%;
+  padding: 10px;
+  margin-bottom: 12px;
+  background: var(--input-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--text-main);
+}
+.table-wrapper{ overflow-x: auto; margin-bottom: 12px; }
+
+table{ width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; table-layout: fixed; }
+th, td{ padding: 8px 4px; border: 1px solid var(--border-color); vertical-align: middle; }
+th{ background: var(--input-bg); color: var(--text-sub); font-size: 12px; }
+td input{ margin-bottom: 0 !important; padding: 6px 6px !important; font-size: 12px; }
+tr.dragging{ opacity: 0.4; background: rgba(37, 99, 235, 0.2); }
+.drag-handle{ cursor: grab; text-align: center; font-size: 16px; color: var(--text-sub); user-select: none; display: inline-block; width: 100%; }
+.locked-row{ opacity: 0.75; background: rgba(0, 0, 0, 0.03); }
+
+.action-cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  flex-wrap: nowrap;
+}
+.btn-move {
+  padding: 4px 5px;
+  font-size: 11px;
+  border: 1px solid var(--border-color);
+  background: var(--input-bg);
+  color: var(--text-main);
+  border-radius: 4px;
+  flex: none;
+  min-width: 0;
+  line-height: 1;
+}
+.btn-delete {
+  padding: 4px 6px;
+  font-size: 11px;
+  border-radius: 4px;
+  flex: none;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.modal-btns{ display: flex; gap: 8px; margin-top: 12px; }
+.footer{ padding: 18px; text-align: center; color: var(--text-sub); font-size: 12px; line-height: 1.8; }
+.guide-box{ background: var(--input-bg); padding: 12px; border-radius: 8px; border: 1px solid var(--border-color); margin-top: 10px; font-size: 12px; line-height: 1.6; }
+
+.skeleton {
+  background: linear-gradient(90deg, var(--input-bg) 25%, var(--border-color) 37%, var(--input-bg) 63%);
+  background-size: 400% 100%;
+  animation: skeleton-loading 1.4s ease infinite;
+  border-radius: 8px;
+  height: 80px;
+  margin-bottom: 12px;
+}
+@keyframes skeleton-loading {
+  0% { background-position: 100% 50%; }
+  100% { background-position: 0 50%; }
+}
+
+@media (max-width: 600px) {
+  .drag-handle { display: none; }
+  th:nth-child(1), td:nth-child(1) { display: none; }
+  .header h1 { font-size: 20px; }
+  .pulse-badge { font-size: 12px; }
+  
+  th:nth-child(2), td:nth-child(2) { width: 32%; }
+  th:nth-child(3), td:nth-child(3) { width: 38%; }
+  th:nth-child(4), td:nth-child(4) { width: 30%; }
+  
+  .card { padding: 8px 3px; }
+  .number { font-size: 18px; }
+  .label-main { font-size: 11px; }
+  .label-sub { font-size: 10px; }
 }
 </style>
 </head>
 <body>
 <div class="container">
   <div class="header">
-    <h1>🌐 Tunnel Monitor</h1>
-    <p>Cloudflare Tunnel 在线监控面板</p>
+    <h1>Cloudflare Tunnel Monitor</h1>
+    <div class="pulse-badge-container">
+      <div class="pulse-badge">
+        <span class="pulse-dot"></span>
+        正在监控 (KV版本)
+      </div>
+    </div>
+    <p>隧道在线状态与多维度健康检测面板</p>
   </div>
+
   <div class="controls">
-    <button class="primary" id="refreshBtn" ${!hasTunnels ? 'disabled' : ''} onclick="triggerRefresh()">${hasTunnels ? '刷新状态' : '隧道未配置'}</button>
-    <button class="success" id="pushBtn" ${!hasTelegram ? 'disabled' : ''} onclick="pushStatus()">${hasTelegram ? '发送状态' : 'TG未配置'}</button>
+    <button class="primary" onclick="triggerRefresh()">刷新状态</button>
+    <button class="success" id="pushBtn" onclick="handleTgPush()">${hasTelegram ? '推送状态' : 'TG未配置'}</button>
+    <button class="dark" onclick="openConfigModal()">配置隧道</button>
   </div>
   
   <div class="stats" id="stats">
-    <div class="card"><div class="number">-</div><div class="label">隧道总数</div></div>
-    <div class="card" style="border-left-color:#16a34a"><div class="number" style="color:#16a34a">-</div><div class="label">在线</div></div>
-    <div class="card" style="border-left-color:#ef4444"><div class="number" style="color:#ef4444">-</div><div class="label">离线</div></div>
+    <div class="card" onclick="toggleAllCards('all')">
+      <div class="number" id="numTotal">0</div>
+      <div class="label-main">隧道总数</div>
+      <span class="label-sub">(展开/收起)</span>
+    </div>
+    <div class="card" onclick="toggleAllCards('online')">
+      <div class="number" style="color:#16a34a" id="numOnline">0</div>
+      <div class="label-main">正常运行</div>
+      <span class="label-sub">(展开)</span>
+    </div>
+    <div class="card" onclick="toggleAllCards('offline')">
+      <div class="number" style="color:#dc2626" id="numOffline">0</div>
+      <div class="label-main">服务中断</div>
+      <span class="label-sub">(展开)</span>
+    </div>
   </div>
 
-  <div class="overview-box" id="overviewBox" style="display:none;">
-    <div class="overview-title">📋 节点大盘快览 <span style="font-weight:normal;font-size:11px;color:#64748b;">点击下方卡片可看详情</span></div>
-    <div class="overview-tags" id="overviewTags"></div>
+  <div class="tunnel-list" id="list">
+    <div class="skeleton"></div>
+    <div class="skeleton"></div>
   </div>
 
-  <div class="tunnel-list" id="list">加载中...</div>
+  <div class="footer">
+    24小时图例：🟢 正常 | 🟡 中断5-10分 | 🔴 中断&gt;10分<br>
+    ⚪ 无数据！请等待下一次Cron计划或手动执行Cron<br>
+    输入密码解锁后可对完整域名进行擦除与查看
+  </div>
+</div>
 
-  <div class="footer">7×24 小时在线记录（数据自动维护）<br>🟩 在线 🟥 离线 ⬜ 无数据</div>
+<!-- 配置弹窗 -->
+<div class="modal" id="configModal">
+  <div class="modal-content">
+    <h3>配置隧道节点 (KV 存储)</h3>
+    <div id="authSection">
+      <input type="password" id="adminPass" placeholder="请输入管理员密码解锁配置">
+      <button class="primary" style="width:100%" onclick="verifyAndLoadConfig()">解锁配置</button>
+    </div>
+
+    <div id="tableSection" style="display:none;">
+      <p style="font-size:12px;color:var(--text-sub);margin-bottom:8px;">📌 环境变量配置已自动置顶锁定；手机上可点击 ⬆️ ⬇️ 进行排序。</p>
+      <div class="table-wrapper">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:35px;text-align:center;">拖拽</th>
+              <th>隧道名称</th>
+              <th>隧道域名</th>
+              <th style="text-align:center;">操作与排序</th>
+            </tr>
+          </thead>
+          <tbody id="configTableBody"></tbody>
+        </table>
+      </div>
+      <button class="success" style="width:100%;margin-bottom:10px;" onclick="addTableRow()">+ 添加隧道节点</button>
+      <div class="modal-btns">
+        <button class="primary" onclick="saveTableConfig()">保存更新</button>
+        <button class="dark" onclick="closeConfigModal()">关闭</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- TG 指南弹窗 -->
+<div class="modal" id="tgGuideModal">
+  <div class="modal-content">
+    <h3>🤖 如何配置 Telegram 告警机器人</h3>
+    <div class="guide-box">
+      <strong>1. 创建机器人：</strong>在 Telegram 中搜索并关注 <code>@BotFather</code>，发送命令 <code>/newbot</code>，按提示获取 <strong>HTTP API Token</strong>。<br>
+      <strong>2. 获取 Chat ID：</strong>在 Telegram 中搜索关注 <code>@userinfobot</code>，发送任意消息，获取你的数字 <strong>Id</strong>。<br>
+      <strong style="color:#dc2626;">3. 关键防呆提醒：找到你刚创建的机器人，必须先点击“START”或发送命令 <code>/start</code> 进行激活，否则机器人无法主动向你推送消息！</strong><br>
+      <strong>4. 写入环境变量：</strong>在 Cloudflare Worker 的“设置 $\rightarrow$ 变量与机密”中分别添加 <code>BOT_TOKEN</code> 和 <code>CHAT_ID</code> 即可。
+    </div>
+    <button class="primary" style="width:100%;margin-top:12px;" onclick="document.getElementById('tgGuideModal').style.display='none'">我知道了</button>
+  </div>
 </div>
 
 <script>
 let localToggleState = {};
-try {
-  localToggleState = JSON.parse(localStorage.getItem("monitor_toggle_state") || "{}");
-} catch(e) {}
+let currentAdminPass = "";
+let unlockedDomainsMap = null;
+let currentItemsCache = [];
+let allExpanded = false;
+let isFetching = false;
+
+try { localToggleState = JSON.parse(localStorage.getItem("monitor_toggle") || "{}"); } catch(e) {}
 
 function triggerRefresh() {
-  const btn = document.getElementById("refreshBtn");
-  btn.innerText = "正在硬刷新...";
-  btn.style.opacity = "0.6";
-  window.location.reload();
+  if (currentItemsCache.length === 0) {
+    alert("防呆提示：未检测到任何监控节点！\\n请前往 CF 控制台的环境变量设置 ARGO，或点击“配置隧道”添加监控节点。");
+  }
+  loadDataAndRender(true);
 }
 
-async function loadDataAndRender(){
-  // 如果隧道压根没配置，直接给一个友好的提示，不去请求 API
-  if(${!hasTunnels}) {
-    document.getElementById("list").innerHTML = '<div style="padding:30px; text-align:center; color:#ef4444; font-size:14px;">⚠️ 监测到环境变量中未配置任何有效的 ARGO 隧道节点。</div>';
-    return;
+async function fetchWithTimeout(resource, options = {}) {
+  const { timeout = 8000 } = options;
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+  try {
+    const response = await fetch(resource, {
+      ...options,
+      signal: controller.signal
+    });
+    clearTimeout(id);
+    return response;
+  } catch (e) {
+    clearTimeout(id);
+    throw e;
+  }
+}
+
+async function loadDataAndRender(isManual = false){
+  if (isFetching) return;
+  isFetching = true;
+
+  if (isManual && currentItemsCache.length === 0) {
+    document.getElementById("list").innerHTML = '<div class="skeleton"></div><div class="skeleton"></div>';
   }
 
   try {
-    const r = await fetch("/status");
+    const r = await fetchWithTimeout("/status", { timeout: 8000 });
     const data = await r.json();
     
-    document.getElementById("stats").innerHTML = \`
-      <div class="card"><div class="number">\${data.total}</div><div class="label">隧道总数</div></div>
-      <div class="card" style="border-left-color:#16a34a"><div class="number" style="color:#16a34a">\${data.online}</div><div class="label">在线</div></div>
-      <div class="card" style="border-left-color:#ef4444"><div class="number" style="color:#ef4444">\${data.offline}</div><div class="label">离线</div></div>
-    \`;
+    currentItemsCache = data.items || [];
+    document.getElementById("numTotal").innerText = data.total || 0;
+    document.getElementById("numOnline").innerText = data.online || 0;
+    document.getElementById("numOffline").innerText = data.offline || 0;
 
     let html = "";
-    let tagsHtml = "";
-
     if(!data.items || data.items.length === 0){
-      html = '<div style="padding:30px; text-align:center; color:#999; font-size:14px;">暂无隧道数据，请等待首次定时触发或手动执行</div>';
-      document.getElementById("overviewBox").style.display = "none";
+      html = '<div style="padding:30px; text-align:center; color:var(--text-sub);">未检测到任何监控节点，请前往 CF 变量与机密或通过“配置隧道”进行添加。</div>';
     } else {
-      document.getElementById("overviewBox").style.display = "block";
-      
       data.items.forEach((v) => {
-        tagsHtml += \`<div class="tag-item">\${v.online ? '🟢' : '🔴'} \${v.name}</div>\`;
+        const isShow = localToggleState[v.name] ?? true;
+        const dotsHtml = v.dots.map(d => \`<div class="dot-item">\${d}</div>\`).join("");
 
-        const storageKey = "toggle_" + v.name;
-        if (localToggleState[storageKey] === undefined) {
-          localToggleState[storageKey] = data.items.length <= 3;
-        }
-        const isShow = localToggleState[storageKey];
+        const realDomain = (unlockedDomainsMap && unlockedDomainsMap[v.name]) ? unlockedDomainsMap[v.name] : v.domain;
+        const domainClass = unlockedDomainsMap ? "domain-clear" : "domain-mask";
 
         html += \`
-          <div class="tunnel \${v.online ? 'online' : 'offline'}">
+          <div class="tunnel \${v.online ? 'online' : 'offline'}" id="tunnel_\${v.name}" data-online="\${v.online}">
             <div class="tunnel-header" onclick="toggleBody('\${v.name}')">
               <div class="tunnel-title-left">
                 <h3>\${v.name} \${v.online ? '🟢' : '🔴'}</h3>
-                <span>\${v.domain}</span>
+                <span class="\${domainClass}">\${realDomain}</span>
               </div>
               <div class="toggle-status" id="btn_\${v.name}">\${isShow ? '收起' : '展开'}</div>
             </div>
             <div class="tunnel-body \${isShow ? 'show' : ''}" id="body_\${v.name}">
-              <div class="status-line">
-                状态：\${v.online ? '<span style="color:#16a34a">在线</span>' : '<span style="color:#ef4444">离线</span>'} 
-                <span style="color:#666;font-weight:normal;font-size:12px;">(状态码: \${v.statusCode})</span>
+              <div>
+                当前状态：<span class="status-badge" style="background:\${v.online ? 'rgba(22,163,74,0.15);color:#16a34a' : 'rgba(220,38,38,0.15);color:#dc2626'}">\${v.online ? '正常运行' : '服务中断'}</span> 
+                <span style="color:var(--text-sub);font-size:12px;margin-left:6px;">(HTTP Status: \${v.statusCode})</span>
               </div>
-              <div class="uptime-line">历史在线率：<strong>\${v.uptime}%</strong></div>
-              <div class="heat">\${v.heat}</div>
+              
+              \${v.online ? \`
+                <div class="healthy-tag">
+                  🛡️ 隧道已健康运行 \${v.healthyText}
+                </div>
+              \` : \`
+                <div class="healthy-tag" style="color:#dc2626;background:rgba(220,38,38,0.1);">
+                  ⚠️ 持续中断：\${v.isZeroMinOffline ? '该节点自纳入监控以来持续处于非活跃状态，请前往 Cloudflare Tunnel 控制台核查链路配置。' : v.offlineDurationText}
+                </div>
+              \`}
+
+              <div class="metrics-30d">
+                📊 近30天中，隧道健康运行 <span class="green-text">\${v.monthMetrics.days}天\${v.monthMetrics.hours}小时</span><br>
+                中断 <span class="red-text">\${v.monthMetrics.incidents}</span> 次，累计中断 <span class="red-text">\${v.monthMetrics.offHours}小时\${v.monthMetrics.offMin}分钟</span>
+              </div>
+
+              <div class="dot-container-wrapper">
+                <div class="dot-title"><span>24小时隧道监控 (00:00 - 24:00)</span><span>最近 &rarr;</span></div>
+                <div class="dot-bar">\${dotsHtml}</div>
+              </div>
             </div>
           </div>
         \`;
       });
     }
     document.getElementById("list").innerHTML = html;
-    document.getElementById("overviewTags").innerHTML = tagsHtml;
   } catch(e) {
-    document.getElementById("list").innerHTML = '<div style="color:red;padding:20px;text-align:center;">数据加载失败，请检查网络或刷新重试</div>';
+    if (currentItemsCache.length === 0) {
+      document.getElementById("list").innerHTML = '<div style="color:#dc2626;padding:20px;text-align:center;">数据加载超时，请点击“刷新状态”重试</div>';
+    }
+  } finally {
+    isFetching = false;
   }
+}
+
+function toggleAllCards(type) {
+  if (currentItemsCache.length === 0) return;
+  allExpanded = !allExpanded;
+  currentItemsCache.forEach(item => {
+    const body = document.getElementById("body_" + item.name);
+    const btn = document.getElementById("btn_" + item.name);
+    if (!body) return;
+
+    let targetShow = false;
+    if (type === 'all') {
+      targetShow = allExpanded;
+    } else if (type === 'online') {
+      targetShow = item.online;
+    } else if (type === 'offline') {
+      targetShow = !item.online;
+    }
+
+    if (targetShow) {
+      body.classList.add("show");
+      btn.innerText = "收起";
+      localToggleState[item.name] = true;
+    } else {
+      body.classList.remove("show");
+      btn.innerText = "展开";
+      localToggleState[item.name] = false;
+    }
+  });
+  localStorage.setItem("monitor_toggle", JSON.stringify(localToggleState));
 }
 
 function toggleBody(name) {
   const body = document.getElementById("body_" + name);
   const btn = document.getElementById("btn_" + name);
-  const storageKey = "toggle_" + name;
-  
-  if (body.classList.contains("show")) {
+  if (!body) return;
+  const isShow = body.classList.contains("show");
+  if (isShow) {
     body.classList.remove("show");
     btn.innerText = "展开";
-    localToggleState[storageKey] = false;
+    localToggleState[name] = false;
   } else {
     body.classList.add("show");
     btn.innerText = "收起";
-    localToggleState[storageKey] = true;
+    localToggleState[name] = true;
   }
-  localStorage.setItem("monitor_toggle_state", JSON.stringify(localToggleState));
+  localStorage.setItem("monitor_toggle", JSON.stringify(localToggleState));
+}
+
+function handleTgPush() {
+  const hasTg = ${hasTelegram};
+  if (!hasTg) {
+    document.getElementById("tgGuideModal").style.display = "flex";
+  } else {
+    pushStatus();
+  }
+}
+
+function openConfigModal() { document.getElementById("configModal").style.display = "flex"; }
+function closeConfigModal() { document.getElementById("configModal").style.display = "none"; }
+
+async function verifyAndLoadConfig() {
+  const pass = document.getElementById("adminPass").value;
+  if (!pass) return alert("请输入密码");
+
+  try {
+    const res = await fetchWithTimeout("/api/get-config?pass=" + encodeURIComponent(pass));
+    const data = await res.json();
+
+    if (data.success) {
+      currentAdminPass = pass;
+      unlockedDomainsMap = {};
+      
+      document.getElementById("authSection").style.display = "none";
+      document.getElementById("tableSection").style.display = "block";
+
+      const tbody = document.getElementById("configTableBody");
+      tbody.innerHTML = "";
+      (data.tunnels || []).forEach(t => {
+        unlockedDomainsMap[t.name] = t.domain;
+        addTableRow(t.name, t.domain, t.isEnv);
+      });
+
+      loadDataAndRender();
+    } else {
+      alert("验证失败：" + data.error);
+    }
+  } catch(e) {
+    alert("请求超时或网络异常");
+  }
+}
+
+function addTableRow(name = "", domain = "", isEnv = false) {
+  const tbody = document.getElementById("configTableBody");
+  const tr = document.createElement("tr");
+  
+  if (isEnv) {
+    tr.className = "locked-row";
+    tr.innerHTML = \`
+      <td style="text-align:center;font-size:11px;color:var(--text-sub);">🔒</td>
+      <td><input type="text" class="t-name" value="\${name}" disabled style="cursor:not-allowed;opacity:0.7;"></td>
+      <td><input type="text" class="t-domain" value="\${domain}" disabled style="cursor:not-allowed;opacity:0.7;"></td>
+      <td style="text-align:center;font-size:11px;color:var(--text-sub);">环境变量锁定</td>
+    \`;
+  } else {
+    tr.draggable = true;
+    tr.innerHTML = \`
+      <td><span class="drag-handle">☰</span></td>
+      <td><input type="text" class="t-name" value="\${name}" placeholder="名称"></td>
+      <td><input type="text" class="t-domain" value="\${domain}" placeholder="域名"></td>
+      <td>
+        <div class="action-cell">
+          <button class="btn-move" onclick="moveRow(this, 'up')">⬆️</button>
+          <button class="btn-move" onclick="moveRow(this, 'down')">⬇️</button>
+          <button class="danger btn-delete" onclick="this.closest('tr').remove()">删除</button>
+        </div>
+      </td>
+    \`;
+    bindDragEvents(tr);
+  }
+  tbody.appendChild(tr);
+}
+
+function moveRow(btn, direction) {
+  const row = btn.closest("tr");
+  if (direction === 'up') {
+    const prev = row.previousElementSibling;
+    if (prev && !prev.classList.contains("locked-row")) {
+      row.parentNode.insertBefore(row, prev);
+    }
+  } else if (direction === 'down') {
+    const next = row.nextElementSibling;
+    if (next) {
+      row.parentNode.insertBefore(next, row);
+    }
+  }
+}
+
+function bindDragEvents(tr) {
+  tr.addEventListener("dragstart", () => tr.classList.add("dragging"));
+  tr.addEventListener("dragend", () => tr.classList.remove("dragging"));
+}
+
+document.getElementById("configTableBody").addEventListener("dragover", (e) => {
+  e.preventDefault();
+  const tbody = document.getElementById("configTableBody");
+  const dragging = tbody.querySelector(".dragging");
+  if (!dragging) return;
+  const targetRow = e.target.closest("tr");
+  if (targetRow && targetRow !== dragging && !targetRow.classList.contains("locked-row")) {
+    const rect = targetRow.getBoundingClientRect();
+    const next = (e.clientY - rect.top)/(rect.bottom - rect.top) > 0.5;
+    tbody.insertBefore(dragging, next ? targetRow.nextSibling : targetRow);
+  }
+});
+
+async function saveTableConfig() {
+  const rows = document.querySelectorAll("#configTableBody tr:not(.locked-row)");
+  const items = [];
+  rows.forEach(tr => {
+    const name = tr.querySelector(".t-name").value.trim();
+    const domain = tr.querySelector(".t-domain").value.trim();
+    if(name && domain) items.push({ name, domain });
+  });
+
+  try {
+    const res = await fetch("/api/save-table-config", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ pass: currentAdminPass, items })
+    });
+    const data = await res.json();
+    if (data.success) {
+      alert("保存成功！");
+      closeConfigModal();
+      unlockedDomainsMap = {};
+      items.forEach(i => unlockedDomainsMap[i.name] = i.domain);
+      loadDataAndRender();
+    } else {
+      alert("保存失败：" + data.error);
+    }
+  } catch(e) {
+    alert("网络异常，保存失败");
+  }
 }
 
 async function pushStatus(){
   const btn = document.getElementById("pushBtn");
-  btn.innerText = "正在发送...";
-  btn.style.opacity = "0.6";
+  btn.innerText = "发送中...";
   try {
     const res = await fetch("/push-status", { method: "POST" });
     const result = await res.json();
-    if(result.success) {
-      alert("📋 实时隧道状态已成功推送到您的 Telegram！");
-    } else {
-      alert("发送失败: " + result.error);
-    }
+    alert(result.success ? "已成功推送 Telegram" : "推送失败: " + result.error);
   } catch(e) {
-    alert("网络请求失败，请稍后重试");
+    alert("网络异常");
   } finally {
-    btn.innerText = "发送状态";
-    btn.style.opacity = "1";
+    btn.innerText = "推送状态";
   }
 }
 
 loadDataAndRender();
-setInterval(loadDataAndRender, 30000);
+setInterval(loadDataAndRender, 60000);
 </script>
 </body>
 </html>`;
 }
 
+function maskDomain(domain) {
+  if (!domain) return "";
+  const parts = domain.split('.');
+  if (parts.length <= 2) {
+    return "***" + domain.slice(Math.floor(domain.length / 2));
+  }
+  return parts[0].slice(0, 2) + "***." + parts.slice(1).join('.');
+}
+
 // ========================================
-// Worker 路由核心
+// Worker 主入口与路由响应 (KV 版)
 // ========================================
 export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
+  async fetch(request, env, ctx) {
+    const kv = getKV(env);
     const config = getConfig(env);
-    const tunnels = parseArgoConfig(config.ARGO);
+    const url = new URL(request.url);
 
-    const hasTunnels = tunnels.length > 0;
-    const hasTelegram = config.BOT_TOKEN !== "" && config.CHAT_ID !== "";
-
-    // 1. 监控主页 (在这里传入当前的配置健全性状态，实现智能防呆样式)
+    // 1. 前端 HTML 渲染
     if (url.pathname === "/" || url.pathname === "/index.html") {
-      return new Response(getFrontendHTML(hasTunnels, hasTelegram), {
-        headers: { "content-type": "text/html;charset=utf-8" }
+      const tunnels = await getMergedTunnels(env);
+      const hasTelegram = Boolean(config.BOT_TOKEN && config.CHAT_ID);
+      return new Response(getFrontendHTML(tunnels.length > 0, hasTelegram), {
+        headers: { "content-type": "text/html;charset=UTF-8" }
       });
     }
 
-    // 2. 读取状态路由
+    // 2. 节点状态获取 API
     if (url.pathname === "/status") {
-      try {
-        const kvNamespace = env.KV;
-        if (!kvNamespace) {
-          return Response.json({ error: "未找到名为大写 KV 的变量绑定。" }, { status: 500 });
+      const tunnels = await getMergedTunnels(env);
+      
+      const resultItems = await Promise.all(tunnels.map(async (t) => {
+        let isOnline = false;
+        let statusCode = 0;
+
+        if (kv) {
+          const rawStatus = await kv.get(`status:${t.name}`);
+          if (rawStatus) {
+            try {
+              const statusData = JSON.parse(rawStatus);
+              isOnline = Boolean(statusData.online);
+              statusCode = statusData.statusCode || 0;
+            } catch(e){}
+          }
         }
 
-        const items = [];
-        for (const tunnel of tunnels) {
-          const rawStatus = await kvNamespace.get(statusKey(tunnel.name));
-          const history = await getHistory(kvNamespace, tunnel.name);
-          
-          let online = false;
-          let statusCode = 0;
-          
+        let metrics = {
+          healthyText: "0天0小时",
+          offlineDurationText: "0分钟",
+          isZeroMinOffline: true,
+          dots: Array(24).fill("⚪"),
+          monthMetrics: { days: 0, hours: 0, incidents: 0, offHours: 0, offMin: 0 }
+        };
+
+        if (kv) {
+          metrics = await computeMetricsKV(kv, t.name, isOnline);
+        }
+
+        return {
+          name: t.name,
+          domain: maskDomain(t.domain),
+          online: isOnline,
+          statusCode: statusCode,
+          ...metrics
+        };
+      }));
+
+      const onlineCount = resultItems.filter(i => i.online).length;
+      const offlineCount = resultItems.length - onlineCount;
+
+      return new Response(JSON.stringify({
+        total: tunnels.length,
+        online: onlineCount,
+        offline: offlineCount,
+        items: resultItems
+      }), { headers: { "content-type": "application/json" } });
+    }
+
+    // 3. 解锁验证并获取完整配置
+    if (url.pathname === "/api/get-config") {
+      const pass = url.searchParams.get("pass");
+      if (pass !== config.ADMIN_PASS) {
+        return new Response(JSON.stringify({ success: false, error: "密码错误" }), { status: 403, headers: { "content-type": "application/json" } });
+      }
+
+      const tunnels = await getMergedTunnels(env);
+      return new Response(JSON.stringify({ success: true, tunnels }), { headers: { "content-type": "application/json" } });
+    }
+
+    // 4. 保存 KV 节点配置
+    if (url.pathname === "/api/save-table-config" && request.method === "POST") {
+      try {
+        const body = await request.json();
+        if (body.pass !== config.ADMIN_PASS) {
+          return new Response(JSON.stringify({ success: false, error: "密码错误" }), { status: 403, headers: { "content-type": "application/json" } });
+        }
+
+        if (!kv) {
+          return new Response(JSON.stringify({ success: false, error: "未绑定 KV 命名空间" }), { headers: { "content-type": "application/json" } });
+        }
+
+        await kv.put("cfg_tunnels", JSON.stringify(body.items || []));
+
+        return new Response(JSON.stringify({ success: true }), { headers: { "content-type": "application/json" } });
+      } catch (e) {
+        return new Response(JSON.stringify({ success: false, error: e.message }), { headers: { "content-type": "application/json" } });
+      }
+    }
+
+    // 5. 手动推送 Telegram 全盘巡检诊断报告
+    if (url.pathname === "/push-status" && request.method === "POST") {
+      const tunnels = await getMergedTunnels(env);
+      if (tunnels.length === 0) {
+        return new Response(JSON.stringify({ success: false, error: "无节点信息" }), { headers: { "content-type": "application/json" } });
+      }
+
+      let onlineCount = 0;
+      let offlineCount = 0;
+      const offlineDetails = [];
+
+      for (const t of tunnels) {
+        let isOnline = false;
+        if (kv) {
+          const rawStatus = await kv.get(`status:${t.name}`);
           if (rawStatus) {
-            const statusObj = JSON.parse(rawStatus);
-            online = statusObj.online;
-            statusCode = statusObj.statusCode;
+            try {
+              const statusData = JSON.parse(rawStatus);
+              isOnline = Boolean(statusData.online);
+            } catch(e){}
+          }
+        }
+
+        if (isOnline) {
+          onlineCount++;
+        } else {
+          offlineCount++;
+          let metrics = { offlineDurationText: "0分钟", isZeroMinOffline: true };
+          if (kv) {
+            metrics = await computeMetricsKV(kv, t.name, false);
           }
 
-          items.push({
-            name: tunnel.name,
-            domain: tunnel.domain,
-            online: online,
-            statusCode: statusCode,
-            uptime: calculateUptime(history),
-            heat: buildHeatmap(history)
+          offlineDetails.push({
+            name: t.name,
+            domain: t.domain,
+            isZeroMinOffline: metrics.isZeroMinOffline,
+            offlineDurationText: metrics.offlineDurationText
           });
         }
-
-        return Response.json({
-          total: items.length,
-          online: items.filter(v => v.online).length,
-          offline: items.filter(v => !v.online).length,
-          items
-        });
-      } catch (e) {
-        return Response.json({ error: e.message }, { status: 500 });
       }
-    }
 
-    // 3. 处理“发送状态”指令到 TG Bot (已完美转换北京时间)
-    if (url.pathname === "/push-status" && request.method === "POST") {
-      try {
-        const kvNamespace = env.KV;
-        if (!kvNamespace) return Response.json({ success: false, error: "KV 绑定缺失" }, { status: 500 });
-        
-        let onlineCount = 0;
-        let offlineCount = 0;
-        const offlineDetails = [];
+      let text = `📊 <b>Tunnel Monitor 节点全盘诊断报告</b>\n`;
+      text += `━━━━━━━━━━━━━━━━━━\n`;
+      text += `🌐 隧道总数：${tunnels.length} 个\n`;
+      text += `🟢 正常运行：${onlineCount} 个\n`;
+      text += `🔴 服务中断：${offlineCount} 个\n`;
 
-        for (const tunnel of tunnels) {
-          const rawStatus = await kvNamespace.get(statusKey(tunnel.name));
-          let online = false;
-          if (rawStatus) {
-            online = JSON.parse(rawStatus).online;
-          }
-          
-          if (online) {
-            onlineCount++;
+      if (offlineCount > 0) {
+        text += `\n⚠️ <b>故障中断节点明细：</b>\n\n`;
+        offlineDetails.forEach((item) => {
+          text += `• <b>${item.name}</b>\n`;
+          text += `  🌐 节点域名：<code>${item.domain}</code>\n`;
+          if (item.isZeroMinOffline) {
+            text += `  ⏱️ 状态提示：该节点自纳入监控以来持续处于非活跃状态，请前往 Cloudflare Tunnel 控制台核查链路配置。\n\n`;
           } else {
-            offlineCount++;
-            offlineDetails.push(`• <b>${tunnel.name}</b> (${tunnel.domain})`);
+            text += `  ⏱️ 持续中断：${item.offlineDurationText}\n\n`;
           }
-        }
-
-        let tgMessage = `📊 <b>Tunnel Monitor 实时大盘状态</b>\n`;
-        tgMessage += `━━━━━━━━━━━━━━━━━━\n`;
-        tgMessage += `🌐 隧道总数：<b>${tunnels.length}</b> 个\n`;
-        tgMessage += `🟢 在线总数：<b>${onlineCount}</b> 个\n`;
-        tgMessage += `🔴 离线数量：<b>${offlineCount}</b> 个\n`;
-        
-        if (offlineCount > 0) {
-          tgMessage += `\n⚠️ <b>离线隧道详情：</b>\n`;
-          tgMessage += offlineDetails.join("\n") + `\n`;
-        } else {
-          tgMessage += `\n✨ 所有监控节点目前运行良好！\n`;
-        }
-        tgMessage += `━━━━━━━━━━━━━━━━━━\n`;
-        // 这里已精准变更为获取绝对可靠的北京时间
-        tgMessage += `⏱️ 发送时间：${getBeijingTimeString()}`;
-
-        const ok = await sendTelegram(config, tgMessage);
-        return Response.json({ success: ok });
-      } catch (e) {
-        return Response.json({ success: false, error: e.message }, { status: 500 });
+        });
+        text = text.trimEnd() + `\n`;
       }
+
+      text += `━━━━━━━━━━━━━━━━━━\n`;
+      text += `⏱️ 报告时间：${getBeijingTimeString()}`;
+
+      const ok = await sendTelegram(env, text);
+      return new Response(JSON.stringify({ success: ok, error: ok ? null : "推送失败，请查验 Telegram Token/Chat ID" }), { headers: { "content-type": "application/json" } });
     }
 
-    return Response.json({ error: "Not Found" }, { status: 404 });
+    return new Response("Not Found", { status: 404 });
   },
 
-  // ========================================
-  // 定时任务触发器
-  // ========================================
+  // 6. Cron 定时巡检任务入口
   async scheduled(event, env, ctx) {
-    if (!env) return;
-    
-    const kvNamespace = env.KV;
-    if (!kvNamespace) return;
-
-    const config = getConfig(env);
-    const tunnels = parseArgoConfig(config.ARGO);
-
-    if (tunnels.length === 0) return;
-
-    ctx.waitUntil(
-      (async () => {
-        try {
-          for (const tunnel of tunnels) {
-            await processTunnel(config, kvNamespace, tunnel);
-          }
-        } catch (e) {
-          console.error(e);
-        }
-      })()
-    );
+    const kv = getKV(env);
+    if (!kv) return;
+    const tunnels = await getMergedTunnels(env);
+    for (const tunnel of tunnels) {
+      ctx.waitUntil(processTunnel(env, kv, tunnel));
+    }
   }
 };
