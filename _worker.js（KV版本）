@@ -1,6 +1,6 @@
 // ========================================
 // Cloudflare Tunnel Monitor (KV Edition)
-// Version: 2.0-KV (Storage Backend: Cloudflare KV)
+// Version: 2.2-KV (Storage Backend: Cloudflare KV)
 // KV Binding Variable Name: KV
 // ========================================
 
@@ -177,35 +177,36 @@ async function computeMetricsKV(kv, name, isCurrentlyOnline) {
     const history = rawHistory ? JSON.parse(rawHistory) : [];
     history.sort((a, b) => a.timestamp - b.timestamp);
 
-    if (isCurrentlyOnline) {
-      const offlineRecords = history.filter(r => r.online === 0);
-      const lastOffline = offlineRecords.length > 0 ? offlineRecords[offlineRecords.length - 1] : null;
+    if (history.length > 0) {
+      if (isCurrentlyOnline) {
+        const offlineRecords = history.filter(r => r.online === 0);
+        const lastOffline = offlineRecords.length > 0 ? offlineRecords[offlineRecords.length - 1] : null;
 
-      let uptimeStart = lastOffline ? lastOffline.timestamp : (now - 30 * 24 * 3600 * 1000);
-      const firstRecord = history[0];
+        let uptimeStart = history[0].timestamp;
+        if (lastOffline) {
+          const firstOnlineAfterOffline = history.find(r => r.online === 1 && r.timestamp > lastOffline.timestamp);
+          uptimeStart = firstOnlineAfterOffline ? firstOnlineAfterOffline.timestamp : lastOffline.timestamp;
+        }
 
-      if (firstRecord && firstRecord.timestamp > uptimeStart) {
-        uptimeStart = firstRecord.timestamp;
-      }
-
-      const diffMs = Math.max(0, now - uptimeStart);
-      const totalHours = Math.floor(diffMs / (1000 * 60 * 60));
-      const days = Math.floor(totalHours / 24);
-      const hours = totalHours % 24;
-      healthyText = `${days}天${hours}小时`;
-    } else {
-      const onlineRecords = history.filter(r => r.online === 1);
-      const lastOnline = onlineRecords.length > 0 ? onlineRecords[onlineRecords.length - 1] : null;
-
-      if (!lastOnline) {
-        isZeroMinOffline = true;
+        const diffMs = Math.max(0, now - uptimeStart);
+        const totalHours = Math.floor(diffMs / (1000 * 60 * 60));
+        const days = Math.floor(totalHours / 24);
+        const hours = totalHours % 24;
+        healthyText = `${days}天${hours}小时`;
       } else {
-        const offDiffMs = Math.max(0, now - lastOnline.timestamp);
-        const offTotalMin = Math.floor(offDiffMs / (1000 * 60));
-        if (offTotalMin === 0) isZeroMinOffline = true;
-        const offHours = Math.floor(offTotalMin / 60);
-        const offMin = offTotalMin % 60;
-        offlineDurationText = offHours > 0 ? `${offHours}小时${offMin}分钟` : `${offMin}分钟`;
+        const onlineRecords = history.filter(r => r.online === 1);
+        const lastOnline = onlineRecords.length > 0 ? onlineRecords[onlineRecords.length - 1] : null;
+
+        if (!lastOnline) {
+          isZeroMinOffline = true;
+        } else {
+          const offDiffMs = Math.max(0, now - lastOnline.timestamp);
+          const offTotalMin = Math.floor(offDiffMs / (1000 * 60));
+          if (offTotalMin === 0) isZeroMinOffline = true;
+          const offHours = Math.floor(offTotalMin / 60);
+          const offMin = offTotalMin % 60;
+          offlineDurationText = offHours > 0 ? `${offHours}小时${offMin}分钟` : `${offMin}分钟`;
+        }
       }
     }
 
@@ -235,28 +236,38 @@ async function computeMetricsKV(kv, name, isCurrentlyOnline) {
       }
     }
 
-    // 近30天数据统计
+    // 近30天数据统计（改用真实时间戳差值计算）
     const thirtyDaysAgo = now - 30 * 24 * 60 * 60 * 1000;
     const monthHistory = history.filter(r => r.timestamp >= thirtyDaysAgo);
 
     let offlineIncidents = 0;
-    let offlineMinutes = 0;
-    let inOfflineState = false;
+    let totalOfflineMs = 0;
 
-    for (let i = 0; i < monthHistory.length; i++) {
-      if (monthHistory[i].online === 0) {
-        offlineMinutes++;
-        if (!inOfflineState) {
-          offlineIncidents++;
-          inOfflineState = true;
+    if (monthHistory.length > 0) {
+      let inOfflineState = false;
+
+      for (let i = 0; i < monthHistory.length; i++) {
+        const current = monthHistory[i];
+        const nextTimestamp = (i < monthHistory.length - 1) ? monthHistory[i + 1].timestamp : now;
+        const duration = Math.max(0, nextTimestamp - current.timestamp);
+
+        if (current.online === 0) {
+          totalOfflineMs += duration;
+          if (!inOfflineState) {
+            offlineIncidents++;
+            inOfflineState = true;
+          }
+        } else {
+          inOfflineState = false;
         }
-      } else {
-        inOfflineState = false;
       }
     }
 
-    const totalMonitoredMin = monthHistory.length;
-    const onlineMinutes = Math.max(0, totalMonitoredMin - offlineMinutes);
+    const totalMonitoredMs = monthHistory.length > 0 ? Math.max(0, now - monthHistory[0].timestamp) : 0;
+    const totalOnlineMs = Math.max(0, totalMonitoredMs - totalOfflineMs);
+
+    const onlineMinutes = Math.floor(totalOnlineMs / (1000 * 60));
+    const offlineMinutes = Math.floor(totalOfflineMs / (1000 * 60));
 
     return {
       healthyText,
@@ -507,7 +518,6 @@ button:hover{ opacity: 0.9; transform: translateY(-1px); }
   border-radius: 8px;
 }
 
-/* 需求1：近30天指标分行样式 */
 .metrics-30d{
   font-size: 12px;
   color: var(--text-sub);
@@ -527,7 +537,6 @@ button:hover{ opacity: 0.9; transform: translateY(-1px); }
   font-weight: bold;
 }
 
-/* 需求2：自适应打卡点容器 */
 .dot-container-wrapper{ margin-top: 10px; width: 100%; }
 .dot-title{ font-size: 11px; color: var(--text-sub); margin-bottom: 6px; display: flex; justify-content: space-between; }
 .dot-bar{
@@ -839,7 +848,7 @@ async function loadDataAndRender(isManual = false){
 
               <div class="metrics-30d">
                 📊 近30天中，隧道健康运行 <span class="green-text">\${v.monthMetrics.days}天\${v.monthMetrics.hours}小时</span><br>
-                中断 <span class="red-text">\${v.monthMetrics.incidents}</span> 次，累计中断 <span class="red-text">\${v.monthMetrics.offHours}小时\${v.monthMetrics.offMin}分钟</span>
+                ⛔️ 中断 <span class="red-text">\${v.monthMetrics.incidents}</span> 次，累计中断 <span class="red-text">\${v.monthMetrics.offHours}小时\${v.monthMetrics.offMin}分钟</span>
               </div>
 
               <div class="dot-container-wrapper">
