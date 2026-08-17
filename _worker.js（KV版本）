@@ -1,6 +1,6 @@
 // ========================================
 // Cloudflare Tunnel Monitor (KV Edition)
-// Version: 2.2-KV (Storage Backend: Cloudflare KV)
+// Version: 2.1-KV (Storage Backend: Cloudflare KV)
 // KV Binding Variable Name: KV
 // ========================================
 
