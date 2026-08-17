@@ -1,6 +1,6 @@
 // ========================================
 // Cloudflare Tunnel Monitor
-// Version: 2.0 (UI Refined & TG Report Standardized)
+// Version: 2.1 (Fixed Time Metric Logic)
 // D1 Binding Variable Name: DB
 // ========================================
 
@@ -200,6 +200,13 @@ async function computeMetrics(db, name, isCurrentlyOnline) {
   let isZeroMinOffline = false;
 
   try {
+    const firstRecord = await db.prepare(`
+      SELECT timestamp FROM tunnel_history WHERE name = ? ORDER BY timestamp ASC LIMIT 1
+    `).bind(name).first();
+
+    let currentUptimeMs = 0;
+    let uptimeStart = now;
+
     if (isCurrentlyOnline) {
       const lastOffline = await db.prepare(`
         SELECT timestamp FROM tunnel_history 
@@ -207,17 +214,16 @@ async function computeMetrics(db, name, isCurrentlyOnline) {
         ORDER BY timestamp DESC LIMIT 1
       `).bind(name).first();
 
-      let uptimeStart = lastOffline ? lastOffline.timestamp : (now - 30 * 24 * 3600 * 1000);
-      const firstRecord = await db.prepare(`
-        SELECT timestamp FROM tunnel_history WHERE name = ? ORDER BY timestamp ASC LIMIT 1
-      `).bind(name).first();
-      
-      if (firstRecord && firstRecord.timestamp > uptimeStart) {
+      if (lastOffline) {
+        uptimeStart = lastOffline.timestamp;
+      } else if (firstRecord) {
         uptimeStart = firstRecord.timestamp;
+      } else {
+        uptimeStart = now;
       }
 
-      const diffMs = Math.max(0, now - uptimeStart);
-      const totalHours = Math.floor(diffMs / (1000 * 60 * 60));
+      currentUptimeMs = Math.max(0, now - uptimeStart);
+      const totalHours = Math.floor(currentUptimeMs / (1000 * 60 * 60));
       const days = Math.floor(totalHours / 24);
       const hours = totalHours % 24;
       healthyText = `${days}天${hours}小时`;
@@ -269,6 +275,7 @@ async function computeMetrics(db, name, isCurrentlyOnline) {
       }
     }
 
+    // 修复：按实际采样点时间差精准计算近 30 天时长
     const thirtyDaysAgo = now - 30 * 24 * 60 * 60 * 1000;
     const monthHistory = await db.prepare(`
       SELECT online, timestamp FROM tunnel_history 
@@ -278,24 +285,45 @@ async function computeMetrics(db, name, isCurrentlyOnline) {
 
     const mRecords = monthHistory.results || [];
     let offlineIncidents = 0;
-    let offlineMinutes = 0;
+    let onlineMs = 0;
+    let offlineMs = 0;
     let inOfflineState = false;
 
     for (let i = 0; i < mRecords.length; i++) {
-      if (mRecords[i].online === 0) {
-        offlineMinutes++;
+      const rec = mRecords[i];
+      let durationMs = 60 * 1000; // 默认采样单位 1 分钟
+
+      if (i > 0) {
+        const diff = rec.timestamp - mRecords[i - 1].timestamp;
+        // 如果两次采样间隔在 15 分钟内，按实际间隔累加，解决非 1 分钟 Cron 或缺失记录导致的时长偏小问题
+        if (diff > 0 && diff <= 15 * 60 * 1000) {
+          durationMs = diff;
+        }
+      }
+
+      if (rec.online === 0) {
+        offlineMs += durationMs;
         if (!inOfflineState) {
           offlineIncidents++;
           inOfflineState = true;
         }
       } else {
+        onlineMs += durationMs;
         inOfflineState = false;
       }
     }
 
-    const totalMonitoredMin = mRecords.length;
-    const onlineMinutes = Math.max(0, totalMonitoredMin - offlineMinutes);
-    
+    // 边界逻辑锁：近30天总在线时长不可小于当前单次连续在线在30天内的覆盖量
+    if (isCurrentlyOnline) {
+      const currentUptimeIn30d = Math.min(currentUptimeMs, 30 * 24 * 60 * 60 * 1000);
+      if (currentUptimeIn30d > onlineMs) {
+        onlineMs = currentUptimeIn30d;
+      }
+    }
+
+    const onlineMinutes = Math.floor(onlineMs / (60 * 1000));
+    const offlineMinutes = Math.floor(offlineMs / (60 * 1000));
+
     return {
       healthyText,
       offlineDurationText,
@@ -545,7 +573,6 @@ button:hover{ opacity: 0.9; transform: translateY(-1px); }
   border-radius: 8px;
 }
 
-/* 需求1：近30天指标分行样式 */
 .metrics-30d{
   font-size: 12px;
   color: var(--text-sub);
@@ -565,7 +592,6 @@ button:hover{ opacity: 0.9; transform: translateY(-1px); }
   font-weight: bold;
 }
 
-/* 需求2：自适应打卡点容器，手机端压缩单行完整显示，电脑端拉满 */
 .dot-container-wrapper{ margin-top: 10px; width: 100%; }
 .dot-title{ font-size: 11px; color: var(--text-sub); margin-bottom: 6px; display: flex; justify-content: space-between; }
 .dot-bar{
@@ -875,13 +901,11 @@ async function loadDataAndRender(isManual = false){
                 </div>
               \`}
 
-              <!-- 需求1：分行高亮格式改进 -->
               <div class="metrics-30d">
                 📊 近30天中，隧道健康运行 <span class="green-text">\${v.monthMetrics.days}天\${v.monthMetrics.hours}小时</span><br>
-                中断 <span class="red-text">\${v.monthMetrics.incidents}</span> 次，累计中断 <span class="red-text">\${v.monthMetrics.offHours}小时\${v.monthMetrics.offMin}分钟</span>
+                ⛔️ 中断 <span class="red-text">\${v.monthMetrics.incidents}</span> 次，累计中断 <span class="red-text">\${v.monthMetrics.offHours}小时\${v.monthMetrics.offMin}分钟</span>
               </div>
 
-              <!-- 需求2：修改文案为 24小时隧道监控 (00:00 - 24:00) -->
               <div class="dot-container-wrapper">
                 <div class="dot-title"><span>24小时隧道监控 (00:00 - 24:00)</span><span>最近 &rarr;</span></div>
                 <div class="dot-bar">\${dotsHtml}</div>
@@ -1216,7 +1240,7 @@ export default {
       }
     }
 
-    // 5. 需求3：手动 Telegram 推送 - 恢复全盘诊断报告排版格式
+    // 5. 手动 Telegram 推送
     if (url.pathname === "/push-status" && request.method === "POST") {
       const tunnels = await getMergedTunnels(env);
       if (tunnels.length === 0) {
